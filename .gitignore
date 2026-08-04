@@ -1,26 +1,39 @@
-# Prerequisites
-*.d
+# Visual Studio build output
+[Dd]ebug/
+[Dd]ebug[Pp]ublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww]in32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
 
-# Compiled Object files
+# Visual Studio cache/options directory
+.vs/
+
+# Compiled object files
 *.slo
 *.lo
 *.o
 *.obj
 
-# Precompiled Headers
+# Precompiled headers
 *.gch
 *.pch
+*.ipch
 
-# Compiled Dynamic libraries
+# Compiled dynamic libraries
 *.so
 *.dylib
 *.dll
 
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
+# Compiled static libraries (the vendored dependency in OpenGLCellularAutomata/lib/ is kept)
 *.lai
 *.la
 *.a
@@ -29,3 +42,36 @@
 *.exe
 *.out
 *.app
+
+# Visual Studio / MSBuild build & debug artifacts
+*.ilk
+*.pdb
+*.idb
+*.tlog
+*.log
+*.recipe
+*.lastbuildstate
+*.iobj
+*.ipdb
+*.tmp
+*.tmp_proj
+
+# Visual Studio user/session files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.db-shm
+*.VC.db-wal
+*.VC.opendb
+*.vsidx
+*.sdf
+*.opensdf
+*.psess
+*.vsp
+*.vspx
+*.sap
+DocumentLayout.json
+DocumentLayout.backup.json
+BuildLog.htm
