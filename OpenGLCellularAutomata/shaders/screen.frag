@@ -6,32 +6,20 @@ in vec2 TexCoord;
 
 uniform usampler2D uTexture;
 
+const int MAX_PALETTE_COLORS = 9;
+uniform vec3 uPalette[MAX_PALETTE_COLORS]; // colors of the palette chosen for this run
+uniform int uPaletteSize;                  // how many entries of uPalette are actually valid
+
 void main() {
     uvec4 cell = texture(uTexture, TexCoord);
-    float alpha = float(cell.a) / 255.0;
+    uint team = cell.r;
 
-    if (cell.r == 1u) {
-        FragColor = vec4(1.0, 1.0, 1.0, 1.0);          // white material = alive (full opacity)
-    } else if (cell.r == 2u) {
-        FragColor = vec4(0.0, 0.4, 1.0, 1.0);          // blue material = alive (full opacity)
-    } else if (cell.r == 3u) {
-        FragColor = vec4(1.0, 1.0, 0.0, 1.0);          // yellow material = alive (full opacity)
-    } else if (cell.r == 4u) {
-        FragColor = vec4(1.0, 0.0, 0.0, 1.0);          // red material = alive (full opacity)
+    if (team == 0u) {
+        FragColor = vec4(0.0, 0.0, 0.0, 1.0); // unclaimed territory: matches the fully-faded HP=0 color below
     } else {
-        // Dead cell - use the stored dead type (in G channel) for color
-        if (alpha > 0.0) {
-            if (cell.g == 1u) {
-                FragColor = vec4(1.0, 1.0, 1.0, alpha);    // fading white
-            } else if (cell.g == 2u) {
-                FragColor = vec4(0.0, 0.4, 1.0, alpha);    // fading blue
-            } else if (cell.g == 3u) {
-                FragColor = vec4(1.0, 1.0, 0.0, alpha);    // fading yellow
-            } else {
-                FragColor = vec4(1.0, 1.0, 1.0, alpha);    // default fading white
-            }
-        } else {
-            FragColor = vec4(0.0, 0.0, 0.0, 1.0);          // fully transparent = black background
-        }
+        vec3 color = uPalette[int(team - 1u) % uPaletteSize];
+        float hpFrac = float(cell.b) / 255.0; // dim young/dying cells, brighten mature/healthy ones
+        color *= hpFrac; // no floor: fades all the way to black as HP approaches 0, so death is a smooth fade rather than a pop
+        FragColor = vec4(color, 1.0);
     }
 }

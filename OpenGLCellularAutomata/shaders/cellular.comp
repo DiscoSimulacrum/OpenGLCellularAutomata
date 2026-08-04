@@ -2,71 +2,157 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0, rgba8ui) uniform readonly uimage2D inputImage;
-layout(binding = 1, rgba8ui) uniform writeonly uimage2D outputImage;
+layout(binding = 0, rgba16ui) uniform readonly uimage2D inputImage;
+layout(binding = 1, rgba16ui) uniform writeonly uimage2D outputImage;
+
+// Cell layout: R = team id (0 = unclaimed), G = age (saturates at 65535, giving room for
+//              lifespans well past 255), B = current hit points, A = current attack.
+const int MAX_TEAMS = 8;
+
+uniform uint uFrame;          // frame counter, used to seed the PRNG
+uniform float uExpandChance;  // per-neighbor chance per tick to claim unclaimed territory
+uniform float uInvadeChance;  // aggressiveness multiplier applied to the attack-vs-HP combat ratio
+uniform float uReproductionCutoff; // fraction of lifespan past which a cell can no longer expand or invade
+
+// Per-team class curves: stat(age) = min(maxStat, baseStat + growth * age)
+uniform float uBaseHP[MAX_TEAMS];
+uniform float uMaxHP[MAX_TEAMS];
+uniform float uHPGrowth[MAX_TEAMS];
+uniform float uBaseAttack[MAX_TEAMS];
+uniform float uMaxAttack[MAX_TEAMS];
+uniform float uAttackGrowth[MAX_TEAMS];
+
+// Per-team old-age mortality: a cell dies of old age the instant its age reaches uLifespan,
+// reverting to unclaimed territory.
+uniform float uLifespan[MAX_TEAMS];
+
+// Per-team cohesion bonus: extra HP/attack per same-team neighbor (0-8), rewarding dense,
+// contiguous territory over thin, isolated tendrils.
+uniform float uAllyHPBonus[MAX_TEAMS];
+uniform float uAllyAttackBonus[MAX_TEAMS];
+
+// Small integer hash (Wang hash variant) for a decorrelated pseudo-random stream.
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// Pseudo-random float in [0,1), unique per (cell, frame, salt).
+float randFloat(ivec2 coord, uint frame, uint salt) {
+    uint h = hash(uint(coord.x) * 1973u + uint(coord.y) * 9277u + frame * 26699u + salt * 2971u);
+    return float(h) / 4294967295.0;
+}
+
+float statAtAge(float base, float maxStat, float growth, float age) {
+    return min(maxStat, base + growth * age);
+}
+
+// Fraction of full HP strength remaining: 1.0 while still growing/at peak, then falls
+// linearly to 0 by the time age reaches lifespan. Multiplying the whole HP total (growth
+// curve + ally bonus) by this means everything fades to true zero together, so death is
+// a smooth fade to black instead of a plateau followed by a pop.
+float hpLifeFraction(float base, float maxStat, float growth, float lifespan, float age) {
+    float ageAtPeak = (maxStat - base) / max(growth, 0.0001);
+    if (age <= ageAtPeak) return 1.0;
+    return clamp((lifespan - age) / max(lifespan - ageAtPeak, 1.0), 0.0, 1.0);
+}
+
+const ivec2 OFFSETS[8] = ivec2[](
+    ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1),
+    ivec2(-1,  0),               ivec2(1,  0),
+    ivec2(-1,  1), ivec2(0,  1), ivec2(1,  1)
+);
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(inputImage);
-    
+
     if (coord.x >= size.x || coord.y >= size.y) return;
-    
-    // Count living neighbors (Conway's Game of Life rules)
-    int neighbors = 0;
-    for (int dx = -1; dx <= 1; dx++) {
-        for (int dy = -1; dy <= 1; dy++) {
-            if (dx == 0 && dy == 0) continue;
-            
-            ivec2 neighborCoord = coord + ivec2(dx, dy);
-            
-            // Wrap around edges (toroidal topology)
-            neighborCoord.x = (neighborCoord.x + size.x) % size.x;
-            neighborCoord.y = (neighborCoord.y + size.y) % size.y;
-            
-            uint neighborValue = imageLoad(inputImage, neighborCoord).r;
-            if (neighborValue > 0u) neighbors++;
+
+    uvec4 self = imageLoad(inputImage, coord);
+    uint currentOwner = self.r;
+    uint currentAge = self.g;
+    uint currentHP = self.b;
+
+    // Load all 8 neighbors once; reused below for combat resolution and ally counting.
+    uvec4 neighbors[8];
+    for (uint idx = 0u; idx < 8u; idx++) {
+        ivec2 neighborCoord = coord + OFFSETS[idx];
+
+        // Wrap around edges (toroidal topology)
+        neighborCoord.x = (neighborCoord.x + size.x) % size.x;
+        neighborCoord.y = (neighborCoord.y + size.y) % size.y;
+
+        neighbors[idx] = imageLoad(inputImage, neighborCoord);
+    }
+
+    // Randomize scan order per-cell/frame so no direction is systematically favored.
+    uint startIdx = hash(uint(coord.x) * 92821u + uint(coord.y) * 68917u + uFrame * 40699u) % 8u;
+
+    uint conqueror = 0u; // 0 = no successful conquest this tick
+
+    for (uint i = 0u; i < 8u; i++) {
+        uint idx = (startIdx + i) % 8u;
+        uint neighborOwner = neighbors[idx].r;
+        if (neighborOwner == 0u || neighborOwner == currentOwner) continue;
+
+        // Cells nearing the end of their lifespan can no longer expand or invade, though
+        // they can still be conquered themselves right up until they die of old age.
+        int neighborTeamIdx = int(neighborOwner) - 1;
+        if (float(neighbors[idx].g) >= uReproductionCutoff * uLifespan[neighborTeamIdx]) continue;
+
+        float roll = randFloat(coord, uFrame, idx);
+
+        if (currentOwner == 0u) {
+            // Unclaimed territory: flat organic-growth chance to be claimed.
+            if (roll < uExpandChance) { conqueror = neighborOwner; break; }
+        } else {
+            // Enemy territory: contest attacker's attack against defender's current HP.
+            float atk = float(neighbors[idx].a);
+            float hp = float(currentHP);
+            float pWin = uInvadeChance * (atk / max(atk + hp, 1.0));
+            if (roll < pWin) { conqueror = neighborOwner; break; }
         }
     }
-    
-    uint currentState = imageLoad(inputImage, coord).r;
-    uint currentAlpha = imageLoad(inputImage, coord).a;
-    uint currentDeadType = imageLoad(inputImage, coord).g; // Store the type of dead cell for fading
-    uint newState = 0u;
-    uint newAlpha = 0u;
-    uint newDeadType = 0u;
-    
-    // Conway's Game of Life rules
-    if (currentState > 0u) {
-        // Cell is alive
-        if (neighbors == 2) {
-            newState = currentState; //stays the same
-            newAlpha = 255u; // Full alpha for living cells
-            newDeadType = 0u; // Reset dead type
-        } else if (neighbors == 3) {
-            newState = 2u; //turns blue
-            newAlpha = 255u; // Full alpha for living cells
-            newDeadType = 0u; // Reset dead type
-        } else {
-            newState = 0u; // dies
-            newAlpha = 255u; // Start fading from full alpha
-            newDeadType = currentState;
-        }
+
+    uint newOwner;
+    uint newAge;
+
+    if (conqueror != 0u) {
+        newOwner = conqueror;
+        newAge = 0u; // fresh conquest, cell restarts its growth curve
+    } else if (currentOwner != 0u && float(currentAge) >= uLifespan[int(currentOwner) - 1]) {
+        // Hit the hard lifespan cutoff: dies of old age, reverting to unclaimed territory.
+        newOwner = 0u;
+        newAge = 0u;
     } else {
-        // Cell is dead
-        if (neighbors == 3) {
-            newState = 4u; // Reborn as living cell (red)
-            newAlpha = 255u; // Full alpha for newly born cells
-            newDeadType = 0u; // Reset dead type
-        } else {
-            // Continue fading
-            newDeadType = currentDeadType; // Preserve the dead type
-            if (currentAlpha > 16u) {
-                newAlpha = currentAlpha - 16u; // Fade by tick
-            } else {
-                newAlpha = 0u;
-            }
-        }
+        newOwner = currentOwner;
+        newAge = (currentOwner == 0u) ? 0u : min(currentAge + 1u, 65535u);
     }
-    
-    imageStore(outputImage, coord, uvec4(newState, newDeadType, 0, newAlpha));
+
+    uint newHP = 0u;
+    uint newAttack = 0u;
+    if (newOwner != 0u) {
+        int teamIdx = int(newOwner) - 1;
+
+        // Count same-team neighbors to reward dense, contiguous territory.
+        uint allyCount = 0u;
+        for (uint idx = 0u; idx < 8u; idx++) {
+            if (neighbors[idx].r == newOwner) allyCount++;
+        }
+
+        float hpFade = hpLifeFraction(uBaseHP[teamIdx], uMaxHP[teamIdx], uHPGrowth[teamIdx], uLifespan[teamIdx], float(newAge));
+        float hp = (statAtAge(uBaseHP[teamIdx], uMaxHP[teamIdx], uHPGrowth[teamIdx], float(newAge))
+                  + uAllyHPBonus[teamIdx] * float(allyCount)) * hpFade;
+        float atk = statAtAge(uBaseAttack[teamIdx], uMaxAttack[teamIdx], uAttackGrowth[teamIdx], float(newAge))
+                  + uAllyAttackBonus[teamIdx] * float(allyCount);
+        newHP = uint(clamp(hp, 0.0, 255.0));
+        newAttack = uint(clamp(atk, 0.0, 255.0));
+    }
+
+    imageStore(outputImage, coord, uvec4(newOwner, newAge, newHP, newAttack));
 }

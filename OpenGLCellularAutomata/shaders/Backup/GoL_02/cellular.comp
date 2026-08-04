@@ -1,0 +1,72 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8ui) uniform readonly uimage2D inputImage;
+layout(binding = 1, rgba8ui) uniform writeonly uimage2D outputImage;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputImage);
+
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    // Count living neighbors (Conway's Game of Life rules)
+    int neighbors = 0;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            if (dx == 0 && dy == 0) continue;
+
+            ivec2 neighborCoord = coord + ivec2(dx, dy);
+
+            // Wrap around edges (toroidal topology)
+            neighborCoord.x = (neighborCoord.x + size.x) % size.x;
+            neighborCoord.y = (neighborCoord.y + size.y) % size.y;
+
+            uint neighborValue = imageLoad(inputImage, neighborCoord).r;
+            if (neighborValue > 0u) neighbors++;
+        }
+    }
+
+    uint currentState = imageLoad(inputImage, coord).r;
+    uint currentAlpha = imageLoad(inputImage, coord).a;
+    uint currentDeadType = imageLoad(inputImage, coord).g; // Store the type of dead cell for fading
+    uint newState = 0u;
+    uint newAlpha = 0u;
+    uint newDeadType = 0u;
+
+    // Conway's Game of Life rules
+    if (currentState > 0u) {
+        // Cell is alive
+        if (neighbors == 2) {
+            newState = currentState; //stays the same
+            newAlpha = 255u; // Full alpha for living cells
+            newDeadType = 0u; // Reset dead type
+        } else if (neighbors == 3) {
+            newState = 2u; //turns blue
+            newAlpha = 255u; // Full alpha for living cells
+            newDeadType = 0u; // Reset dead type
+        } else {
+            newState = 0u; // dies
+            newAlpha = 255u; // Start fading from full alpha
+            newDeadType = currentState;
+        }
+    } else {
+        // Cell is dead
+        if (neighbors == 3) {
+            newState = 4u; // Reborn as living cell (red)
+            newAlpha = 255u; // Full alpha for newly born cells
+            newDeadType = 0u; // Reset dead type
+        } else {
+            // Continue fading
+            newDeadType = currentDeadType; // Preserve the dead type
+            if (currentAlpha > 16u) {
+                newAlpha = currentAlpha - 16u; // Fade by tick
+            } else {
+                newAlpha = 0u;
+            }
+        }
+    }
+
+    imageStore(outputImage, coord, uvec4(newState, newDeadType, 0, newAlpha));
+}
