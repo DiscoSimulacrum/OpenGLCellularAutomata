@@ -24,36 +24,85 @@ const int GRID_SIZE = 1024;         //Simulation size (square); window is now si
 
 const int NUM_TEAMS = 6;            //Number of competing slime colonies (must be <= palette size in screen.frag)
 const int MAX_TEAMS = 8;            //Size of the per-team uniform arrays in cellular.comp (matches its color palette)
-const float EXPAND_CHANCE = 0.08f;    //Per-neighbor chance per tick to claim unclaimed territory
-const float INVADE_CHANCE = 0.25f;    //Aggressiveness multiplier applied to the attacker-attack-vs-defender-HP ratio
-const float REPRODUCTION_CUTOFF = 0.8f; //Fraction of a cell's lifespan past which it can no longer expand or invade
+const float EXPAND_CHANCE = 0.08f;    //Action-chance multiplier when claiming unclaimed territory (combat itself is deterministic, no chance involved -- see cellular.comp)
 
-// Per-color archetype: controls a colony's starting hit points/attack and how those stats
-// grow with age (stat(age) = min(maxStat, baseStat + growth * age)); HP peaks the same way
-// but then declines linearly back to 0 as age approaches lifespan, so cells visibly weaken
-// and fade out as death nears. At age == lifespan a cell dies outright (hard cutoff),
-// reverting to unclaimed territory and letting long-held interiors hollow out over time.
-// allyHPBonus/allyAttackBonus grant extra HP/attack per same-team neighbor (0-8), rewarding
-// dense, contiguous blobs over thin, isolated tendrils.
+const float HOME_SOURCE_STRENGTH = 40.0f;   //Energy/tick generated at each team's colony-center source
+const float FREE_SOURCE_STRENGTH = 25.0f;   //Energy/tick generated at each scattered neutral source
+const int NUM_FREE_SOURCES = 18;            //Count of scattered neutral energy sources placed across the map
+const float MIN_SOURCE_TO_BLOB_DIST = 75.0f;   //Placement rejection radius (px) around blob centers
+const float MIN_SOURCE_TO_SOURCE_DIST = 60.0f; //Placement rejection radius (px) between sources
+
+// Shared by every team -- no longer an archetype differentiator, just the shape of the
+// economy everyone plays within.
+const float ENERGY_CAPACITY = 1500.0f; //Max storable energy per cell, same for all teams
+const float UPKEEP_COST = 0.3f;       //Energy spent per tick just to stay alive, same for all teams
+
+// Reproduction's EXPECTED cost (see totalAttackSpend in cellular.comp) is startEnergy *
+// this multiplier, same for every team -- a team's reproductionWillingness (see SlimeClass
+// below) changes how OFTEN it succeeds at claiming empty land, not how much each success
+// costs on average, keeping the playing field even on energy economics while still letting
+// teams differ in how eagerly they reproduce.
+const float REPRODUCTION_COST_MULTIPLIER = 1.2f;
+
+// Conductivity reinforcement: a per-cell memory of recent energy throughput (see
+// cellular.comp) that boosts a cell's effective sharing rate the more it's been relaying
+// energy, and decays back down when it isn't -- lets supply routes between a source and an
+// active frontier organize into reinforced "trunk lines" instead of staying a plain
+// diffusion gradient. Shared by every team, not a per-archetype dial, same as the two
+// constants above. First-guess starting values -- expect to need empirical tuning.
+const float CONDUCTIVITY_DECAY = 0.02f; //Per-tick decay fraction (~35-tick half-life)
+const float CONDUCTIVITY_GAIN = 0.01f; //Scales this tick's throughput into conductivity growth (boosted 20x from 0.0005 -- first attempt showed no visible reinforcement)
+const float CONDUCTIVITY_BOOST = 1.0f;   //Multiplier in effectiveRate; at max conductivity (4.0) this triples the effective sharing rate
+
+// Per-color profile: purely behavioral now (no stat archetypes like durability/burst damage --
+// energyCapacity/upkeepCost are shared globals above, and there's no ally-bonus or lifespan
+// mechanic). A cell dies only one way: its energy is driven to zero (upkeep, sharing, and/or
+// combat damage) and it reverts to unclaimed land. See the field comments below and the
+// fuller explanation above DEFAULT_TEAM_CLASSES for how
+// each behavioral dial works.
 struct SlimeClass {
     const char* name;
-    float baseHP, maxHP, hpGrowth;
-    float baseAttack, maxAttack, attackGrowth;
-    float lifespan;
-    float allyHPBonus, allyAttackBonus;
+    float startEnergy;          // energy a newly-claimed cell begins with
+    float transferRate;         // altruism
+    float reproductionWillingness; // scales how often (not how much) a team attempts/succeeds at claiming unclaimed land -- see REPRODUCTION_COST_MULTIPLIER
+    float aggressionFraction;   // damage dealt per hostile neighbor touched, and the cost of maintaining it
+    float defenseFraction;      // percentage reduction applied to incoming combat damage, capped in cellular.comp so it can't exceed 0.9
 };
 
-// Note: age is stored as a 16-bit channel in the cell texture (saturates at 65535), giving
-// plenty of headroom for lifespans well beyond the old 8-bit ceiling. Longer lifespans mean
-// longer HP-decline windows too, which is what makes the pre-death fade look smooth instead
-// of abrupt.
+// Starting points only -- expect these to get tuned (by hand or by an evolutionary
+// algorithm) once real matches are observed. startEnergy and the expected cost of a
+// reproduction success (REPRODUCTION_COST_MULTIPLIER, shared by all teams) are kept
+// perfectly even across teams -- differences come entirely from behavior: how altruistic
+// (transferRate), reproductive (reproductionWillingness), aggressive (aggressionFraction),
+// and defensive (defenseFraction) each team is.
+//
+// reproductionWillingness multiplies the flat EXPAND_CHANCE odds of claiming an unclaimed
+// neighbor each tick -- an eager team (>1.0) succeeds sooner on average, a reluctant team
+// (<1.0) succeeds later, but because the per-tick cost scales with that same effective
+// chance, the EXPECTED total energy spent per successful claim is startEnergy *
+// REPRODUCTION_COST_MULTIPLIER regardless of willingness (see totalAttackSpend in
+// cellular.comp). Claiming empty land is still the only probabilistic part of the sim --
+// combat itself is fully deterministic (see below).
+//
+// aggressionFraction/defenseFraction govern combat, which is a continuous, deterministic
+// erosion process, not a coin flip: every tick, a cell takes damage = (each hostile
+// neighbor's energy * that neighbor's aggressionFraction), summed across all hostile
+// neighbors, then reduced by this cell's own defenseFraction as a straight percentage
+// mitigation. A cell dies (reverts to unclaimed land) whenever its energy is driven to zero
+// by any combination of upkeep, sharing, and combat damage -- there's no separate
+// "conquered" event or free energy grant on death; the vacated tile just gets recontested
+// through the normal reproduction path like any other empty cell.
+// Expander (aggressive reproduction + low aggression + moderate defense) empirically produced
+// the healthiest-looking results under the deterministic siege combat model -- the other five
+// were pulled ~65% of the way toward its transferRate/reproductionWillingness/aggression/
+// defense values below, keeping just enough spread for identity rather than full duplicates.
 const SlimeClass DEFAULT_TEAM_CLASSES[NUM_TEAMS] = {
-    { "Tank",         180.0f, 220.0f, 3.0f,  60.0f,  120.0f, 3.0f, 880.0f, 5.0f, 4.0f }, // very tough, weak attacker, ages slowly, modest cohesion
-    { "Berserker",      60.0f, 140.0f, 1.0f, 120.0f, 255.0f, 4.0f, 520.0f, 1.0f, 1.0f }, // fragile, lethal fast, burns out young, fights alone
-    { "Balanced",       120.0f, 200.0f, 2.0f, 90.0f, 150.0f, 2.0f, 720.0f, 5.0f, 5.0f }, // no strong strengths or weaknesses
-    { "Glass Cannon",   40.0f,  90.0f, 0.5f, 150.0f, 255.0f, 5.0f, 400.0f, 3.0f, 1.0f }, // devastating once mature, shortest-lived, fights alone
-    { "Bulwark",        200.0f, 240.0f, 1.0f,  60.0f, 90.0f, 0.5f, 980.0f, 7.0f, 4.0f }, // extremely tough, longest-lived, strong fortress bonus
-    { "Swarm",          70.0f, 150.0f, 2.5f,  80.0f, 180.0f, 3.0f, 640.0f, 9.0f, 9.0f }, // moderate stats, thrives most on numbers
+    { "Expander",    600.0f, 0.03f, 2.0f, 0.08f, 0.15f }, // spreads into empty land fast, doesn't share, doesn't fight, turtles a bit if touched
+    { "Cooperator",  600.0f, 0.05f, 1.4f, 0.08f, 0.15f }, // shares a bit more than most, doesn't fight much, leans on allies + modest defense
+    { "Raider",      600.0f, 0.04f, 1.4f, 0.19f, 0.12f }, // still the most aggressive of the six, but far less of a glass cannon than before
+    { "Diplomat",    600.0f, 0.04f, 1.7f, 0.08f, 0.17f }, // grows and shares peacefully, avoids fights, relies on defense to survive contact
+    { "Warlord",     600.0f, 0.04f, 1.8f, 0.17f, 0.13f }, // expands and fights hard, moderate defense
+    { "Zealot",      600.0f, 0.04f, 1.4f, 0.17f, 0.15f }, // doesn't expand as eagerly as Expander, still leans aggressive
 };
 
 // Mutable at runtime: starts as a copy of DEFAULT_TEAM_CLASSES, optionally overwritten by
@@ -98,6 +147,14 @@ struct ColorPalette {
     std::vector<Color> colors;
 };
 
+// Mirrors cellular.comp's encodeEnergy: splits a float energy value into the integer (B)
+// and fractional 1/256ths (A) channel pair used to seed a cell's stored energy.
+void encodeEnergy(float energy, uint16_t& whole, uint16_t& frac) {
+    float e = std::max(energy, 0.0f);
+    whole = (uint16_t)std::min(std::floor(e), 65535.0f);
+    frac = (uint16_t)std::min(std::max((e - std::floor(e)) * 256.0f, 0.0f), 255.0f);
+}
+
 const std::vector<ColorPalette> COLOR_PALETTES = {
     { "Sunset Ocean", {
         hexColor(0x005F73), hexColor(0x0A9396), hexColor(0x94D2BD),
@@ -125,6 +182,7 @@ class SlimeMold {
 private:
     GLuint computeProgram = 0, renderProgram = 0;
     GLuint textureA = 0, textureB = 0;
+    GLuint sourceMapTexture = 0; // static per-cell energy-generation strength; never ping-ponged, bound once
     GLuint VAO = 0, VBO = 0;
     int width, height;
     bool useTextureA = true;
@@ -147,6 +205,10 @@ public:
         createTextures();
         initializeGrid();
         setupQuad();
+
+        // The source map never changes after this point, so bind it once here rather
+        // than re-binding every step() like the ping-pong pair (which does rotate).
+        glBindImageTexture(2, sourceMapTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
         return true;
     }
 
@@ -161,8 +223,6 @@ public:
 
         glUniform1ui(glGetUniformLocation(computeProgram, "uFrame"), simFrame);
         glUniform1f(glGetUniformLocation(computeProgram, "uExpandChance"), EXPAND_CHANCE);
-        glUniform1f(glGetUniformLocation(computeProgram, "uInvadeChance"), INVADE_CHANCE);
-        glUniform1f(glGetUniformLocation(computeProgram, "uReproductionCutoff"), REPRODUCTION_CUTOFF);
 
         glDispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
@@ -179,6 +239,12 @@ public:
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, useTextureA ? textureA : textureB);
         glUniform1i(glGetUniformLocation(renderProgram, "uTexture"), 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, sourceMapTexture);
+        glUniform1i(glGetUniformLocation(renderProgram, "uSourceMap"), 1);
+
+        glUniform1f(glGetUniformLocation(renderProgram, "uTime"), (float)glfwGetTime());
 
         glBindVertexArray(VAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -230,6 +296,7 @@ public:
         if (renderProgram) glDeleteProgram(renderProgram);
         if (textureA) glDeleteTextures(1, &textureA);
         if (textureB) glDeleteTextures(1, &textureB);
+        if (sourceMapTexture) glDeleteTextures(1, &sourceMapTexture);
         if (VAO) glDeleteVertexArrays(1, &VAO);
         if (VBO) glDeleteBuffers(1, &VBO);
     }
@@ -314,33 +381,39 @@ private:
         return linkProgram(renderProgram);
     }
 
-    // Uploads each team's growth-curve constants to the compute shader once; these never
-    // change during a run, so there's no need to re-set them every step().
+    // Uploads the shared economy constants and each team's behavioral constants to the
+    // compute shader once; these never change during a run, so there's no need to re-set
+    // them every step().
     void uploadTeamClasses() {
         glUseProgram(computeProgram);
 
-        float baseHP[MAX_TEAMS] = {}, maxHP[MAX_TEAMS] = {}, hpGrowth[MAX_TEAMS] = {};
-        float baseAtk[MAX_TEAMS] = {}, maxAtk[MAX_TEAMS] = {}, atkGrowth[MAX_TEAMS] = {};
-        float lifespan[MAX_TEAMS] = {};
-        float allyHPBonus[MAX_TEAMS] = {}, allyAttackBonus[MAX_TEAMS] = {};
+        glUniform1f(glGetUniformLocation(computeProgram, "uEnergyCapacity"), ENERGY_CAPACITY);
+        glUniform1f(glGetUniformLocation(computeProgram, "uUpkeepCost"), UPKEEP_COST);
+        glUniform1f(glGetUniformLocation(computeProgram, "uReproductionCostMultiplier"), REPRODUCTION_COST_MULTIPLIER);
+        glUniform1f(glGetUniformLocation(computeProgram, "uConductivityDecay"), CONDUCTIVITY_DECAY);
+        glUniform1f(glGetUniformLocation(computeProgram, "uConductivityGain"), CONDUCTIVITY_GAIN);
+        glUniform1f(glGetUniformLocation(computeProgram, "uConductivityBoost"), CONDUCTIVITY_BOOST);
+
+        float startEnergy[MAX_TEAMS] = {};
+        float transferRate[MAX_TEAMS] = {};
+        float reproductionWillingness[MAX_TEAMS] = {};
+        float aggressionFraction[MAX_TEAMS] = {};
+        float defenseFraction[MAX_TEAMS] = {};
 
         for (int i = 0; i < NUM_TEAMS; i++) {
             const SlimeClass& c = TEAM_CLASSES[i];
-            baseHP[i] = c.baseHP;   maxHP[i] = c.maxHP;   hpGrowth[i] = c.hpGrowth;
-            baseAtk[i] = c.baseAttack; maxAtk[i] = c.maxAttack; atkGrowth[i] = c.attackGrowth;
-            lifespan[i] = c.lifespan;
-            allyHPBonus[i] = c.allyHPBonus; allyAttackBonus[i] = c.allyAttackBonus;
+            startEnergy[i] = c.startEnergy;
+            transferRate[i] = c.transferRate;
+            reproductionWillingness[i] = c.reproductionWillingness;
+            aggressionFraction[i] = c.aggressionFraction;
+            defenseFraction[i] = c.defenseFraction;
         }
 
-        glUniform1fv(glGetUniformLocation(computeProgram, "uBaseHP"), MAX_TEAMS, baseHP);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uMaxHP"), MAX_TEAMS, maxHP);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uHPGrowth"), MAX_TEAMS, hpGrowth);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uBaseAttack"), MAX_TEAMS, baseAtk);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uMaxAttack"), MAX_TEAMS, maxAtk);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uAttackGrowth"), MAX_TEAMS, atkGrowth);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uLifespan"), MAX_TEAMS, lifespan);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uAllyHPBonus"), MAX_TEAMS, allyHPBonus);
-        glUniform1fv(glGetUniformLocation(computeProgram, "uAllyAttackBonus"), MAX_TEAMS, allyAttackBonus);
+        glUniform1fv(glGetUniformLocation(computeProgram, "uStartEnergy"), MAX_TEAMS, startEnergy);
+        glUniform1fv(glGetUniformLocation(computeProgram, "uTransferRate"), MAX_TEAMS, transferRate);
+        glUniform1fv(glGetUniformLocation(computeProgram, "uReproductionWillingness"), MAX_TEAMS, reproductionWillingness);
+        glUniform1fv(glGetUniformLocation(computeProgram, "uAggressionFraction"), MAX_TEAMS, aggressionFraction);
+        glUniform1fv(glGetUniformLocation(computeProgram, "uDefenseFraction"), MAX_TEAMS, defenseFraction);
     }
 
     // Picks one of COLOR_PALETTES at random and uploads it to the render shader.
@@ -374,6 +447,11 @@ private:
         glUseProgram(renderProgram);
         glUniform3fv(glGetUniformLocation(renderProgram, "uPalette"), MAX_PALETTE_COLORS, flatColors.data());
         glUniform1i(glGetUniformLocation(renderProgram, "uPaletteSize"), (int)palette.colors.size());
+
+        // Needed to normalize the energy-fraction brightness in screen.frag; shared by every
+        // team now, and doesn't change during a run, so it's uploaded here alongside the
+        // palette rather than every frame.
+        glUniform1f(glGetUniformLocation(renderProgram, "uEnergyCapacity"), ENERGY_CAPACITY);
     }
 
     void createTextures() {
@@ -388,11 +466,22 @@ private:
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         }
+
+        // Static energy-source strength map: never ping-ponged, populated once in
+        // initializeGrid() and never touched again.
+        glGenTextures(1, &sourceMapTexture);
+        glBindTexture(GL_TEXTURE_2D, sourceMapTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, width, height, 0, GL_RED, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     }
 
     // Seeds NUM_TEAMS randomly placed, organically-shaped blobs (circles deformed by
-    // a couple of random sine harmonics in polar coordinates) on an otherwise empty grid.
-    // Each blob starts at age 0 with its team class's base HP/attack.
+    // a couple of random sine harmonics in polar coordinates) on an otherwise empty grid,
+    // plus the static energy-source map: one source at each blob's center, and a handful
+    // of additional neutral sources scattered elsewhere for colonies to fight over.
     void initializeGrid() {
         std::vector<uint16_t> data(width * height * 4, 0);
 
@@ -422,8 +511,8 @@ private:
             centers.push_back({ cx, cy });
 
             const SlimeClass& cls = TEAM_CLASSES[team - 1];
-            uint16_t startHP = (uint16_t)std::min(255.0f, std::max(0.0f, cls.baseHP));
-            uint16_t startAttack = (uint16_t)std::min(255.0f, std::max(0.0f, cls.baseAttack));
+            uint16_t startEnergyWhole, startEnergyFrac;
+            encodeEnergy(cls.startEnergy, startEnergyWhole, startEnergyFrac);
 
             float baseRadius = (float)radiusDist(gen);
             int freq1 = freqDist(gen), freq2 = freqDist(gen);
@@ -441,10 +530,10 @@ private:
                         int px = ((cx + dx) % width + width) % width;
                         int py = ((cy + dy) % height + height) % height;
                         int idx = (py * width + px) * 4;
-                        data[idx + 0] = (uint16_t)team;   // team
-                        data[idx + 1] = 0;                 // age
-                        data[idx + 2] = startHP;           // hit points
-                        data[idx + 3] = startAttack;       // attack
+                        data[idx + 0] = (uint16_t)team;         // team
+                        data[idx + 1] = 0;                       // age
+                        data[idx + 2] = startEnergyWhole;        // energy (integer part)
+                        data[idx + 3] = startEnergyFrac;         // energy (fractional part)
                     }
                 }
             }
@@ -452,6 +541,41 @@ private:
 
         glBindTexture(GL_TEXTURE_2D, textureA);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, data.data());
+
+        // Energy-source map: one home source per blob center (reusing the centers already
+        // computed above), plus scattered neutral sources rejection-sampled away from every
+        // blob center and every other source.
+        std::vector<float> sourceData(width * height, 0.0f);
+        auto placeSource = [&](int x, int y, float strength) {
+            sourceData[y * width + x] = strength;
+        };
+        for (auto& c : centers) placeSource(c.first, c.second, HOME_SOURCE_STRENGTH);
+
+        std::vector<std::pair<int, int>> allSources = centers;
+        for (int i = 0; i < NUM_FREE_SOURCES; i++) {
+            int sx = 0, sy = 0;
+            for (int attempt = 0; attempt < 50; attempt++) {
+                sx = posDist(gen);
+                sy = posDist(gen);
+                bool farEnough = true;
+                for (auto& c : centers) {
+                    float dx = (float)(sx - c.first), dy = (float)(sy - c.second);
+                    if (dx * dx + dy * dy < MIN_SOURCE_TO_BLOB_DIST * MIN_SOURCE_TO_BLOB_DIST) { farEnough = false; break; }
+                }
+                if (farEnough) {
+                    for (auto& s : allSources) {
+                        float dx = (float)(sx - s.first), dy = (float)(sy - s.second);
+                        if (dx * dx + dy * dy < MIN_SOURCE_TO_SOURCE_DIST * MIN_SOURCE_TO_SOURCE_DIST) { farEnough = false; break; }
+                    }
+                }
+                if (farEnough) break;
+            }
+            allSources.push_back({ sx, sy });
+            placeSource(sx, sy, FREE_SOURCE_STRENGTH);
+        }
+
+        glBindTexture(GL_TEXTURE_2D, sourceMapTexture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_FLOAT, sourceData.data());
     }
 
     void setupQuad() {
@@ -479,11 +603,13 @@ struct RunConfig {
 //   --ticks <N>   Run N simulation ticks headlessly (no window/rendering/framerate limit),
 //                 print final per-team territory counts as "RESULT:c1,c2,...,cN" to stdout,
 //                 then exit. Omit this flag to run the normal interactive fullscreen mode.
-//   --stats <csv> Comma-separated list of NUM_TEAMS * 9 floats (baseHP, maxHP, hpGrowth,
-//                 baseAttack, maxAttack, attackGrowth, lifespan, allyHPBonus,
-//                 allyAttackBonus, repeated per team in team order) overriding the
-//                 compiled-in defaults. Lets an external evolutionary-algorithm driver feed
-//                 in candidate parameter sets without recompiling. Works in either mode.
+//   --stats <csv> Comma-separated list of NUM_TEAMS * 5 floats (startEnergy, transferRate,
+//                 reproductionWillingness, aggressionFraction, defenseFraction, repeated per
+//                 team in team order) overriding the compiled-in defaults. Lets an external
+//                 evolutionary-algorithm driver feed in candidate parameter sets without
+//                 recompiling. Works in either mode. (ENERGY_CAPACITY/UPKEEP_COST/REPRODUCTION_
+//                 COST_MULTIPLIER are shared globals, not per-team, so they aren't part of
+//                 this list.)
 RunConfig parseArgs(int argc, char** argv) {
     for (int i = 0; i < NUM_TEAMS; i++) TEAM_CLASSES[i] = DEFAULT_TEAM_CLASSES[i];
 
@@ -500,23 +626,19 @@ RunConfig parseArgs(int argc, char** argv) {
             std::string token;
             while (std::getline(ss, token, ',')) values.push_back(std::stof(token));
 
-            if ((int)values.size() != NUM_TEAMS * 9) {
-                std::cerr << "--stats expects " << (NUM_TEAMS * 9) << " comma-separated values, got "
+            if ((int)values.size() != NUM_TEAMS * 5) {
+                std::cerr << "--stats expects " << (NUM_TEAMS * 5) << " comma-separated values, got "
                           << values.size() << std::endl;
                 std::exit(1);
             }
 
             for (int t = 0; t < NUM_TEAMS; t++) {
-                const float* v = &values[t * 9];
-                TEAM_CLASSES[t].baseHP          = v[0];
-                TEAM_CLASSES[t].maxHP           = v[1];
-                TEAM_CLASSES[t].hpGrowth        = v[2];
-                TEAM_CLASSES[t].baseAttack      = v[3];
-                TEAM_CLASSES[t].maxAttack       = v[4];
-                TEAM_CLASSES[t].attackGrowth    = v[5];
-                TEAM_CLASSES[t].lifespan        = v[6];
-                TEAM_CLASSES[t].allyHPBonus     = v[7];
-                TEAM_CLASSES[t].allyAttackBonus = v[8];
+                const float* v = &values[t * 5];
+                TEAM_CLASSES[t].startEnergy             = v[0];
+                TEAM_CLASSES[t].transferRate             = v[1];
+                TEAM_CLASSES[t].reproductionWillingness  = v[2];
+                TEAM_CLASSES[t].aggressionFraction       = v[3];
+                TEAM_CLASSES[t].defenseFraction          = v[4];
             }
         }
     }

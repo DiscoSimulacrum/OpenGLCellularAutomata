@@ -4,32 +4,64 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(binding = 0, rgba16ui) uniform readonly uimage2D inputImage;
 layout(binding = 1, rgba16ui) uniform writeonly uimage2D outputImage;
+layout(binding = 2, r32f) uniform readonly image2D uSourceMap; // static energy-generation strength per cell; never changes after map generation
 
-// Cell layout: R = team id (0 = unclaimed), G = age (saturates at 65535, giving room for
-//              lifespans well past 255), B = current hit points, A = current attack.
+// Cell layout: R = team id (0 = unclaimed), G = conductivity (see decodeConductivity/
+// encodeConductivity), B = energy integer part, A = energy fractional part (1/256ths) --
+// see decodeEnergy/encodeEnergy. A cell's stored energy is both its defensive reserve and
+// the source of its attack power, replacing HP/attack/age-growth entirely. A cell dies only
+// one way: it runs out of energy (starvation) -- whether that's from upkeep, a bad trade in
+// sharing, or combat damage inflicted by hostile neighbors makes no difference, they all
+// just subtract from the same pool. There's no separate "conquered" event or age/lifespan
+// mortality -- a cell that starves reverts to unclaimed land and gets recontested through
+// the normal reproduction path like any other empty tile. Conductivity is a per-cell memory
+// of recent energy throughput that reinforces itself over time (see effectiveRate below),
+// letting supply routes between a source and an active frontier organize into "trunk lines"
+// rather than staying a plain, undirected diffusion gradient.
 const int MAX_TEAMS = 8;
 
 uniform uint uFrame;          // frame counter, used to seed the PRNG
-uniform float uExpandChance;  // per-neighbor chance per tick to claim unclaimed territory
-uniform float uInvadeChance;  // aggressiveness multiplier applied to the attack-vs-HP combat ratio
-uniform float uReproductionCutoff; // fraction of lifespan past which a cell can no longer expand or invade
+uniform float uExpandChance;  // action-chance multiplier when claiming unclaimed territory
 
-// Per-team class curves: stat(age) = min(maxStat, baseStat + growth * age)
-uniform float uBaseHP[MAX_TEAMS];
-uniform float uMaxHP[MAX_TEAMS];
-uniform float uHPGrowth[MAX_TEAMS];
-uniform float uBaseAttack[MAX_TEAMS];
-uniform float uMaxAttack[MAX_TEAMS];
-uniform float uAttackGrowth[MAX_TEAMS];
+// Shared by every team -- no longer a per-archetype differentiator. What now varies between
+// teams is purely behavioral: how altruistic (transferRate), reproductive, and aggressive
+// each one is.
+uniform float uEnergyCapacity;
+uniform float uUpkeepCost;
+uniform float uReproductionCostMultiplier; // shared by every team: the EXPECTED energy cost of one successful land claim is startEnergy * this, regardless of a team's reproductionWillingness (see totalAttackSpend)
 
-// Per-team old-age mortality: a cell dies of old age the instant its age reaches uLifespan,
-// reverting to unclaimed territory.
-uniform float uLifespan[MAX_TEAMS];
+// Conductivity reinforcement dynamics (shared by every team, like the economy constants
+// above -- a property of the world's physics, not a per-team behavioral dial).
+uniform float uConductivityDecay;  // per-tick decay fraction applied to existing conductivity
+uniform float uConductivityGain;   // scales this tick's throughput into conductivity growth
+uniform float uConductivityBoost;  // multiplier in effectiveRate; at max conductivity (4.0), scales the effective share rate by (1 + boost*4.0)
 
-// Per-team cohesion bonus: extra HP/attack per same-team neighbor (0-8), rewarding dense,
-// contiguous territory over thin, isolated tendrils.
-uniform float uAllyHPBonus[MAX_TEAMS];
-uniform float uAllyAttackBonus[MAX_TEAMS];
+// Per-team behavior. transferRate = altruism: the base rate at which a cell gives energy to
+// a poorer cardinal (N/W/E/S) same-team neighbor, proportional to the energy gap, before
+// conductivity reinforcement (see effectiveRate) -- letting supply flow from a source out to
+// the frontier, and letting whichever paths carry the most sustained flow become
+// progressively better conduits. aggressionFraction is how much damage a cell deals to each
+// hostile neighbor it touches: damage_i = thatNeighbor'sEnergy * aggressionFraction, summed
+// across every hostile neighbor, deterministically, every tick -- no RNG, no coin flip. It
+// also still sets the flat per-tick cost of maintaining that aggression (see totalAttackSpend
+// below), which is a separate ledger from the damage dealt: the attacker burns its own energy
+// independently of how much damage lands, rather than one funding the other. defenseFraction
+// is the mirror image: a percentage reduction applied to all incoming combat damage this cell
+// takes (capped well below 1.0 so it can never fully negate or invert into healing), at the
+// same flat per-tick cost as aggression. reproductionWillingness plays the analogous role for
+// claiming unclaimed land: it multiplies the flat uExpandChance odds of success each tick,
+// so an eager team (>1.0) succeeds sooner
+// on average and a reluctant team (<1.0) succeeds later -- but because the per-tick cost
+// scales with that same effective chance (see totalAttackSpend below), the EXPECTED total
+// cost paid before one success occurs is always startEnergy * uReproductionCostMultiplier
+// (the shared global above), regardless of willingness. That keeps startEnergy and
+// reproduction's economics perfectly even across teams; only how OFTEN a team reproduces
+// differs.
+uniform float uStartEnergy[MAX_TEAMS];             // energy a newly-claimed cell begins with
+uniform float uTransferRate[MAX_TEAMS];            // altruism
+uniform float uReproductionWillingness[MAX_TEAMS]; // multiplies uExpandChance's odds of claiming unclaimed territory
+uniform float uAggressionFraction[MAX_TEAMS];      // damage dealt per hostile neighbor, and cost of maintaining it
+uniform float uDefenseFraction[MAX_TEAMS];         // percentage reduction applied to incoming combat damage
 
 // Small integer hash (Wang hash variant) for a decorrelated pseudo-random stream.
 uint hash(uint x) {
@@ -47,18 +79,37 @@ float randFloat(ivec2 coord, uint frame, uint salt) {
     return float(h) / 4294967295.0;
 }
 
-float statAtAge(float base, float maxStat, float growth, float age) {
-    return min(maxStat, base + growth * age);
+// Combines the integer (B) and fractional (A, in 1/256ths) channels into a float energy
+// value. The fractional channel exists so slow trickle transfers (well under 1.0/tick for
+// low-transferRate teams) accumulate correctly instead of being truncated to 0 forever.
+float decodeEnergy(uint whole, uint frac) {
+    return float(whole) + float(frac) / 256.0;
 }
 
-// Fraction of full HP strength remaining: 1.0 while still growing/at peak, then falls
-// linearly to 0 by the time age reaches lifespan. Multiplying the whole HP total (growth
-// curve + ally bonus) by this means everything fades to true zero together, so death is
-// a smooth fade to black instead of a plateau followed by a pop.
-float hpLifeFraction(float base, float maxStat, float growth, float lifespan, float age) {
-    float ageAtPeak = (maxStat - base) / max(growth, 0.0001);
-    if (age <= ageAtPeak) return 1.0;
-    return clamp((lifespan - age) / max(lifespan - ageAtPeak, 1.0), 0.0, 1.0);
+void encodeEnergy(float energy, out uint whole, out uint frac) {
+    float e = max(energy, 0.0);
+    whole = uint(min(floor(e), 65535.0));
+    frac = uint(clamp(fract(e) * 256.0, 0.0, 255.0));
+}
+
+// Conductivity is a single 16-bit fixed-point value (not split whole+fractional like energy)
+// covering the range [0, 4.0]. Unlike energy, it's a slowly-evolving decay-then-accumulate
+// memory rather than a value where sub-1.0 absolute amounts get permanently lost each tick,
+// so a single scaled channel is precise enough (~0.00024 resolution).
+const float CONDUCTIVITY_SCALE = 16383.0;
+
+float decodeConductivity(uint raw) {
+    return float(raw) / CONDUCTIVITY_SCALE;
+}
+
+uint encodeConductivity(float c) {
+    return uint(clamp(c, 0.0, 4.0) * CONDUCTIVITY_SCALE);
+}
+
+// Boosts a team's base sharing rate by how conductive the giving cell currently is -- a cell
+// that has recently relayed a lot of energy becomes a progressively better conduit.
+float effectiveRate(float baseRate, float conductivity) {
+    return baseRate * (1.0 + uConductivityBoost * conductivity);
 }
 
 const ivec2 OFFSETS[8] = ivec2[](
@@ -66,6 +117,10 @@ const ivec2 OFFSETS[8] = ivec2[](
     ivec2(-1,  0),               ivec2(1,  0),
     ivec2(-1,  1), ivec2(0,  1), ivec2(1,  1)
 );
+
+// Indices into OFFSETS/neighbors[] for the 4 cardinal directions (N, W, E, S) -- energy
+// sharing only considers these, not the 4 diagonals (combat/expansion still uses all 8).
+const uint CARDINAL_IDX[4] = uint[](1u, 3u, 4u, 6u);
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -75,10 +130,9 @@ void main() {
 
     uvec4 self = imageLoad(inputImage, coord);
     uint currentOwner = self.r;
-    uint currentAge = self.g;
-    uint currentHP = self.b;
+    float currentEnergy = decodeEnergy(self.b, self.a);
 
-    // Load all 8 neighbors once; reused below for combat resolution and ally counting.
+    // Load all 8 neighbors once; reused below for combat resolution and diffusion.
     uvec4 neighbors[8];
     for (uint idx = 0u; idx < 8u; idx++) {
         ivec2 neighborCoord = coord + OFFSETS[idx];
@@ -90,69 +144,179 @@ void main() {
         neighbors[idx] = imageLoad(inputImage, neighborCoord);
     }
 
+    int teamIdx = int(currentOwner) - 1; // only meaningful while currentOwner != 0u
+
     // Randomize scan order per-cell/frame so no direction is systematically favored.
     uint startIdx = hash(uint(coord.x) * 92821u + uint(coord.y) * 68917u + uFrame * 40699u) % 8u;
 
-    uint conqueror = 0u; // 0 = no successful conquest this tick
+    // Reproduction: unclaimed land may get claimed by one random qualifying neighbor this
+    // tick. Unchanged in spirit from before -- still probabilistic, and only reachable when
+    // currentOwner == 0u (there's no energy here to erode, so combat doesn't apply).
+    uint claimant = 0u;
+    if (currentOwner == 0u) {
+        for (uint i = 0u; i < 8u; i++) {
+            uint idx = (startIdx + i) % 8u;
+            uint neighborOwner = neighbors[idx].r;
+            if (neighborOwner == 0u) continue;
 
-    for (uint i = 0u; i < 8u; i++) {
-        uint idx = (startIdx + i) % 8u;
-        uint neighborOwner = neighbors[idx].r;
-        if (neighborOwner == 0u || neighborOwner == currentOwner) continue;
-
-        // Cells nearing the end of their lifespan can no longer expand or invade, though
-        // they can still be conquered themselves right up until they die of old age.
-        int neighborTeamIdx = int(neighborOwner) - 1;
-        if (float(neighbors[idx].g) >= uReproductionCutoff * uLifespan[neighborTeamIdx]) continue;
-
-        float roll = randFloat(coord, uFrame, idx);
-
-        if (currentOwner == 0u) {
-            // Unclaimed territory: flat organic-growth chance to be claimed.
-            if (roll < uExpandChance) { conqueror = neighborOwner; break; }
-        } else {
-            // Enemy territory: contest attacker's attack against defender's current HP.
-            float atk = float(neighbors[idx].a);
-            float hp = float(currentHP);
-            float pWin = uInvadeChance * (atk / max(atk + hp, 1.0));
-            if (roll < pWin) { conqueror = neighborOwner; break; }
+            // No defending energy to overcome, so the odds are the flat action chance scaled
+            // by the claimant's own reproductionWillingness -- an eager team claims empty land
+            // faster than a reluctant one, though both pay the same EXPECTED total cost per
+            // success (see totalAttackSpend below).
+            int claimantTeamIdx = int(neighborOwner) - 1;
+            float pWin = uExpandChance * uReproductionWillingness[claimantTeamIdx];
+            float roll = randFloat(coord, uFrame, idx);
+            if (roll < pWin) { claimant = neighborOwner; break; }
         }
     }
+
+    // Combat: a claimed cell deterministically erodes under fire from every hostile neighbor
+    // at once -- no RNG, no per-tick coin flip. Damage is each attacker's own energy times
+    // its aggressionFraction (data already available from this cell's own 1-ring gather),
+    // summed across every hostile neighbor, then reduced by this cell's own defenseFraction
+    // as a straight percentage mitigation (capped well below 1.0 so an out-of-range --stats
+    // override can never push it negative/healing). This is a separate ledger from the flat
+    // totalAttackSpend an attacker pays just for bordering an enemy (below) -- both sides
+    // burn energy independently while in contact, rather than one funding the other.
+    bool hasUnclaimedNeighbor = false;
+    bool hasEnemyNeighbor = false;
+    float combatDamage = 0.0;
+    if (currentOwner != 0u) {
+        for (uint idx = 0u; idx < 8u; idx++) {
+            uint neighborOwner = neighbors[idx].r;
+            if (neighborOwner == currentOwner) continue;
+            if (neighborOwner == 0u) { hasUnclaimedNeighbor = true; continue; }
+            hasEnemyNeighbor = true;
+            float attackerEnergy = decodeEnergy(neighbors[idx].b, neighbors[idx].a);
+            int attackerTeamIdx = int(neighborOwner) - 1;
+            combatDamage += attackerEnergy * uAggressionFraction[attackerTeamIdx];
+        }
+        float mitigation = 1.0 - min(uDefenseFraction[teamIdx], 0.9);
+        combatDamage *= mitigation;
+    }
+
+    // Attacker-side energy debit: committing energy toward reproduction or aggression/defense
+    // costs that energy whether or not it actually pays off this tick. This is a single flat
+    // commitment per behavior category the cell is currently engaged in (not multiplied by how
+    // many qualifying neighbors it touches) -- a cell bordering both unclaimed and enemy
+    // territory pays for reproduction once and for aggression+defense (bundled, since both
+    // trigger off the same "bordering an enemy" condition) once, but doesn't pay more just for
+    // touching several neighbors of the same kind at once.
+    //
+    // Reproduction's cost is calibrated against the odds it actually succeeds at this tick
+    // (uExpandChance * this team's reproductionWillingness, established above) rather than
+    // the attacker's current energy: paying effectiveExpandChance * startEnergy *
+    // uReproductionCostMultiplier every tick means the EXPECTED total paid over the
+    // ~1/effectiveExpandChance ticks until one success lands is startEnergy *
+    // uReproductionCostMultiplier -- independent of willingness, since a higher willingness
+    // raises both the per-tick cost AND how soon it lands, by the same factor. A global
+    // multiplier of 1.0 would make reproduction breakeven on average for every team equally;
+    // anything higher makes it a net energy sink for everyone equally. This sidesteps needing
+    // to know (which an attacker's own invocation architecturally can't) whether this
+    // specific tick was the one that actually won a contested empty cell.
+    float totalAttackSpend = 0.0;
+    if (currentOwner != 0u) {
+        if (hasUnclaimedNeighbor) {
+            float effectiveExpandChance = uExpandChance * uReproductionWillingness[teamIdx];
+            totalAttackSpend += effectiveExpandChance * uStartEnergy[teamIdx] * uReproductionCostMultiplier;
+        }
+        if (hasEnemyNeighbor) totalAttackSpend += currentEnergy * (uAggressionFraction[teamIdx] + uDefenseFraction[teamIdx]);
+        totalAttackSpend = min(totalAttackSpend, currentEnergy); // can't go into energy debt
+    }
+
+    // Per-cardinal-direction energy sharing, boosted by conductivity (see effectiveRate).
+    // The giving side of each edge always uses its OWN conductivity, and both endpoints of
+    // an edge read the same giver's conductivity (their own if they're giving, the
+    // neighbor's if they're receiving), so a gain on one side always exactly matches a loss
+    // on the other -- conservation holds the same way it did before conductivity existed,
+    // just with a per-cell rather than per-team rate. Also tracks how much is given away
+    // separately so it can be capped -- without this, a cell with several much-poorer
+    // neighbors at once and a high effective rate could try to give away more energy than it
+    // actually holds. grossThroughput (the sum of what actually moved, both directions) is
+    // what drives this cell's own conductivity growth below.
+    float netTransfer = 0.0;
+    float totalGive = 0.0;
+    float grossThroughput = 0.0;
+    if (currentOwner != 0u) {
+        float selfConductivity = decodeConductivity(self.g);
+        for (uint c = 0u; c < 4u; c++) {
+            uint idx = CARDINAL_IDX[c];
+            if (neighbors[idx].r != currentOwner) continue;
+            float neighborEnergy = decodeEnergy(neighbors[idx].b, neighbors[idx].a);
+            float neighborConductivity = decodeConductivity(neighbors[idx].g);
+
+            float share;
+            if (neighborEnergy > currentEnergy) {
+                // I receive, using the GIVER's (neighbor's) conductivity-boosted rate.
+                share = effectiveRate(uTransferRate[teamIdx], neighborConductivity) * (neighborEnergy - currentEnergy);
+            } else if (neighborEnergy < currentEnergy) {
+                // I give, using MY OWN conductivity-boosted rate.
+                share = -effectiveRate(uTransferRate[teamIdx], selfConductivity) * (currentEnergy - neighborEnergy);
+            } else {
+                share = 0.0;
+            }
+
+            netTransfer += share;
+            grossThroughput += abs(share);
+            if (share < 0.0) totalGive += -share;
+        }
+        if (totalGive > currentEnergy) {
+            // Safety cap: claw back the excess so this cell can't go into debt from giving.
+            // Rare in practice -- only kicks in with several much-poorer neighbors and a
+            // high effective rate at once. Those neighbors still compute their own receive
+            // amount independently and won't see this cap, so this is a small, accepted
+            // approximation in that specific edge case rather than an exact conservation
+            // guarantee.
+            netTransfer += (totalGive - currentEnergy);
+        }
+    }
+
+    // Conductivity update: decay-then-accumulate, using the real throughput just computed.
+    // Gross (both directions summed as absolute values), not net -- a perfect mid-trunk
+    // conduit both receives from the source side and gives to the frontier side
+    // simultaneously, so net flow could be near zero even while gross throughput (and thus
+    // reinforcement) is high.
+    float newConductivity = 0.0;
+    if (currentOwner != 0u) {
+        float oldConductivity = decodeConductivity(self.g);
+        newConductivity = clamp(
+            oldConductivity * (1.0 - uConductivityDecay) + uConductivityGain * grossThroughput,
+            0.0, 4.0
+        );
+    }
+
+    float sourceGain = (currentOwner != 0u) ? imageLoad(uSourceMap, coord).r : 0.0;
+    float upkeep = (currentOwner != 0u) ? uUpkeepCost : 0.0;
+
+    float netEnergyChange = sourceGain + netTransfer - totalAttackSpend - upkeep - combatDamage;
 
     uint newOwner;
-    uint newAge;
+    float newEnergy;
+    float finalConductivity;
 
-    if (conqueror != 0u) {
-        newOwner = conqueror;
-        newAge = 0u; // fresh conquest, cell restarts its growth curve
-    } else if (currentOwner != 0u && float(currentAge) >= uLifespan[int(currentOwner) - 1]) {
-        // Hit the hard lifespan cutoff: dies of old age, reverting to unclaimed territory.
+    if (currentOwner == 0u) {
+        if (claimant != 0u) {
+            newOwner = claimant;
+            newEnergy = uStartEnergy[int(claimant) - 1];
+        } else {
+            newOwner = 0u;
+            newEnergy = 0.0;
+        }
+        finalConductivity = 0.0; // freshly claimed (or still empty): no relay history yet
+    } else if ((currentEnergy + netEnergyChange) <= 0.0) {
+        // Starved: upkeep, net sharing, attack-spend, and/or combat damage outpaced supply --
+        // reverts to unclaimed land, to be recontested through the reproduction path above
+        // like any other empty tile (no separate "conqueror" grant).
         newOwner = 0u;
-        newAge = 0u;
+        newEnergy = 0.0;
+        finalConductivity = 0.0;
     } else {
         newOwner = currentOwner;
-        newAge = (currentOwner == 0u) ? 0u : min(currentAge + 1u, 65535u);
+        newEnergy = clamp(currentEnergy + netEnergyChange, 0.0, uEnergyCapacity);
+        finalConductivity = newConductivity; // held by the same team: apply the decay+accumulate update
     }
 
-    uint newHP = 0u;
-    uint newAttack = 0u;
-    if (newOwner != 0u) {
-        int teamIdx = int(newOwner) - 1;
-
-        // Count same-team neighbors to reward dense, contiguous territory.
-        uint allyCount = 0u;
-        for (uint idx = 0u; idx < 8u; idx++) {
-            if (neighbors[idx].r == newOwner) allyCount++;
-        }
-
-        float hpFade = hpLifeFraction(uBaseHP[teamIdx], uMaxHP[teamIdx], uHPGrowth[teamIdx], uLifespan[teamIdx], float(newAge));
-        float hp = (statAtAge(uBaseHP[teamIdx], uMaxHP[teamIdx], uHPGrowth[teamIdx], float(newAge))
-                  + uAllyHPBonus[teamIdx] * float(allyCount)) * hpFade;
-        float atk = statAtAge(uBaseAttack[teamIdx], uMaxAttack[teamIdx], uAttackGrowth[teamIdx], float(newAge))
-                  + uAllyAttackBonus[teamIdx] * float(allyCount);
-        newHP = uint(clamp(hp, 0.0, 255.0));
-        newAttack = uint(clamp(atk, 0.0, 255.0));
-    }
-
-    imageStore(outputImage, coord, uvec4(newOwner, newAge, newHP, newAttack));
+    uint newB, newA;
+    encodeEnergy(newEnergy, newB, newA);
+    imageStore(outputImage, coord, uvec4(newOwner, encodeConductivity(finalConductivity), newB, newA));
 }
