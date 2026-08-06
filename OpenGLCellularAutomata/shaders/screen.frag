@@ -27,7 +27,15 @@ void main() {
         base = uPalette[int(team - 1u) % uPaletteSize];
         float energy = float(cell.b) + float(cell.a) / 256.0; // mirrors cellular.comp's decodeEnergy
         float energyFrac = clamp(energy / uEnergyCapacity, 0.0, 1.0);
-        color = base * energyFrac; // no floor: fades all the way to black as energy runs out, so death is a smooth fade rather than a pop
+
+        // Cube-root curve, not a straight lerp: most cells live well under uEnergyCapacity
+        // (it's sized for the theoretical max, not typical holdings -- e.g. startEnergy 300 /
+        // capacity 1500 is a 0.2 fraction), so a linear map left the whole sim looking dim and
+        // washed out most of the time. pow(x, 1/3) boosts low/mid fractions hard (0.2 -> ~0.58)
+        // while still hitting exactly 0 at 0 and 1 at capacity, so death is still a smooth fade
+        // to black rather than a pop -- just far brighter in the range cells actually live in.
+        float brightness = pow(energyFrac, 1.0 / 3.0);
+        color = base * brightness;
 
         // Debug/verification overlay: tint toward white proportional to conductivity (see
         // cellular.comp's decodeConductivity -- same 16383.0 scale, range [0,4.0]), so

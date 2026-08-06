@@ -36,11 +36,16 @@ uniform float uConductivityDecay;  // per-tick decay fraction applied to existin
 uniform float uConductivityGain;   // scales this tick's throughput into conductivity growth
 uniform float uConductivityBoost;  // multiplier in effectiveRate; at max conductivity (4.0), scales the effective share rate by (1 + boost*4.0)
 
-// Per-team behavior. transferRate = altruism: the base rate at which a cell gives energy to
-// a poorer cardinal (N/W/E/S) same-team neighbor, proportional to the energy gap, before
-// conductivity reinforcement (see effectiveRate) -- letting supply flow from a source out to
-// the frontier, and letting whichever paths carry the most sustained flow become
-// progressively better conduits. aggressionFraction is how much damage a cell deals to each
+// Per-team behavior. transferRate = altruism: the base rate at which a cell pushes/pulls
+// energy to/from a poorer/richer cardinal (N/W/E/S) same-team neighbor, before conductivity
+// reinforcement (see effectiveRate) -- letting supply flow from a source out to the frontier,
+// and letting whichever paths carry the most sustained flow become progressively better
+// conduits. energySatisfied is the target level a cell tries to hold, NOT its maximum: a cell
+// above its target pushes that surplus onward at full rate regardless of how small the local
+// gap to a specific neighbor is, rather than throttling down once neighbors are close in
+// value the way plain diffusion does (see the sharing section below for why).
+//
+// aggressionFraction is how much damage a cell deals to each
 // hostile neighbor it touches: damage_i = thatNeighbor'sEnergy * aggressionFraction, summed
 // across every hostile neighbor, deterministically, every tick -- no RNG, no coin flip. It
 // also still sets the flat per-tick cost of maintaining that aggression (see totalAttackSpend
@@ -58,6 +63,7 @@ uniform float uConductivityBoost;  // multiplier in effectiveRate; at max conduc
 // reproduction's economics perfectly even across teams; only how OFTEN a team reproduces
 // differs.
 uniform float uStartEnergy[MAX_TEAMS];             // energy a newly-claimed cell begins with
+uniform float uEnergySatisfied[MAX_TEAMS];         // target energy level this team's cells push toward/shed surplus above -- see sharing section below
 uniform float uTransferRate[MAX_TEAMS];            // altruism
 uniform float uReproductionWillingness[MAX_TEAMS]; // multiplies uExpandChance's odds of claiming unclaimed territory
 uniform float uAggressionFraction[MAX_TEAMS];      // damage dealt per hostile neighbor, and cost of maintaining it
@@ -178,14 +184,14 @@ void main() {
     // override can never push it negative/healing). This is a separate ledger from the flat
     // totalAttackSpend an attacker pays just for bordering an enemy (below) -- both sides
     // burn energy independently while in contact, rather than one funding the other.
-    bool hasUnclaimedNeighbor = false;
+    uint unclaimedNeighborCount = 0u;
     bool hasEnemyNeighbor = false;
     float combatDamage = 0.0;
     if (currentOwner != 0u) {
         for (uint idx = 0u; idx < 8u; idx++) {
             uint neighborOwner = neighbors[idx].r;
             if (neighborOwner == currentOwner) continue;
-            if (neighborOwner == 0u) { hasUnclaimedNeighbor = true; continue; }
+            if (neighborOwner == 0u) { unclaimedNeighborCount++; continue; }
             hasEnemyNeighbor = true;
             float attackerEnergy = decodeEnergy(neighbors[idx].b, neighbors[idx].a);
             int attackerTeamIdx = int(neighborOwner) - 1;
@@ -196,64 +202,116 @@ void main() {
     }
 
     // Attacker-side energy debit: committing energy toward reproduction or aggression/defense
-    // costs that energy whether or not it actually pays off this tick. This is a single flat
-    // commitment per behavior category the cell is currently engaged in (not multiplied by how
-    // many qualifying neighbors it touches) -- a cell bordering both unclaimed and enemy
-    // territory pays for reproduction once and for aggression+defense (bundled, since both
-    // trigger off the same "bordering an enemy" condition) once, but doesn't pay more just for
-    // touching several neighbors of the same kind at once.
+    // costs that energy whether or not it actually pays off this tick. Aggression+defense
+    // remains a single flat commitment regardless of how many enemy neighbors are touched
+    // (bundled, since both trigger off the same "bordering an enemy" condition) -- the damage
+    // dealt already scales with enemy-neighbor count via combatDamage above, so this maintenance
+    // fee deliberately doesn't double up on that.
     //
-    // Reproduction's cost is calibrated against the odds it actually succeeds at this tick
-    // (uExpandChance * this team's reproductionWillingness, established above) rather than
-    // the attacker's current energy: paying effectiveExpandChance * startEnergy *
-    // uReproductionCostMultiplier every tick means the EXPECTED total paid over the
-    // ~1/effectiveExpandChance ticks until one success lands is startEnergy *
-    // uReproductionCostMultiplier -- independent of willingness, since a higher willingness
-    // raises both the per-tick cost AND how soon it lands, by the same factor. A global
-    // multiplier of 1.0 would make reproduction breakeven on average for every team equally;
-    // anything higher makes it a net energy sink for everyone equally. This sidesteps needing
-    // to know (which an attacker's own invocation architecturally can't) whether this
-    // specific tick was the one that actually won a contested empty cell.
+    // Reproduction's cost, by contrast, is charged PER contested unclaimed edge (not once
+    // per cell), because each unclaimed neighbor runs its own independent reproduction roll
+    // (see the claimant loop above) -- a cell touching k unclaimed neighbors is simultaneously
+    // entered in k separate lotteries and can win more than one in the same tick, minting a
+    // fresh startEnergy on each empty cell that succeeds. A flat per-cell charge here let a
+    // wide frontier (many unclaimed edges per attacker, exactly the situation at the start of
+    // a run) mint far more energy via simultaneous claims than the flat fee ever paid for --
+    // confirmed via the total-energy-vs-source-income check in main.cpp's
+    // checkEnergyConservation(), which measured total grid energy growing ~80x faster than
+    // source income could account for. Charging per unclaimed edge instead keeps the original
+    // invariant (expected total spend before ONE contested edge resolves is startEnergy *
+    // uReproductionCostMultiplier, independent of willingness) but now holds per-edge rather
+    // than assuming at most one edge per attacker.
     float totalAttackSpend = 0.0;
     if (currentOwner != 0u) {
-        if (hasUnclaimedNeighbor) {
+        if (unclaimedNeighborCount > 0u) {
             float effectiveExpandChance = uExpandChance * uReproductionWillingness[teamIdx];
-            totalAttackSpend += effectiveExpandChance * uStartEnergy[teamIdx] * uReproductionCostMultiplier;
+            totalAttackSpend += float(unclaimedNeighborCount) * effectiveExpandChance * uStartEnergy[teamIdx] * uReproductionCostMultiplier;
         }
         if (hasEnemyNeighbor) totalAttackSpend += currentEnergy * (uAggressionFraction[teamIdx] + uDefenseFraction[teamIdx]);
         totalAttackSpend = min(totalAttackSpend, currentEnergy); // can't go into energy debt
     }
 
     // Per-cardinal-direction energy sharing, boosted by conductivity (see effectiveRate).
-    // The giving side of each edge always uses its OWN conductivity, and both endpoints of
-    // an edge read the same giver's conductivity (their own if they're giving, the
-    // neighbor's if they're receiving), so a gain on one side always exactly matches a loss
-    // on the other -- conservation holds the same way it did before conductivity existed,
-    // just with a per-cell rather than per-team rate. Also tracks how much is given away
-    // separately so it can be capped -- without this, a cell with several much-poorer
-    // neighbors at once and a high effective rate could try to give away more energy than it
-    // actually holds. grossThroughput (the sum of what actually moved, both directions) is
-    // what drives this cell's own conductivity growth below.
+    // Two components are combined, and the STRONGER of the two wins per edge:
+    //
+    //  - baseShare: the original plain-diffusion term, proportional to the raw energy gap to
+    //    this specific neighbor. Kept as an unconditional floor -- see below for why.
+    //  - surplusShare: energy above this team's satisfaction target (uEnergySatisfied) pushed
+    //    toward a poorer neighbor regardless of how small the immediate gap to them is, so an
+    //    interior "trunk" cell fed from behind keeps pumping its surplus onward every tick even
+    //    after locally equalizing with its neighbors, instead of settling into the flow-starved
+    //    equilibrium plain diffusion produces once gaps shrink to near zero. That starvation
+    //    was the original problem: it kept conductivity (needs throughput to grow) from
+    //    building up along a path's whole length, confining strong flow to the single sharp
+    //    gap right at an active frontier's leading tip.
+    //
+    // Using surplusShare ALONE (no baseShare floor) was tried first and broke the sim: every
+    // freshly-claimed cell starts at startEnergy, which is below every team's satisfaction
+    // target, so a newly-claimed frontier -- where most neighbors are also fresh and below
+    // target -- got literally zero mutual support (neighborSurplus/selfSurplus both 0) and
+    // starved en masse under nothing but upkeep, visible as territory fragmenting into
+    // flickering single-pixel noise instead of stable blobs. Taking max(baseShare,
+    // surplusShare) keeps the old baseline diffusion always available as a safety net, while
+    // still letting genuine surplus (mainly near sources, and along paths that have built up
+    // conductivity) punch well above what plain diffusion would allow.
+    //
+    // Both terms, and the final result, stay capped by the actual pairwise gap (min() below)
+    // -- can't push/pull past what the other side actually has relative to me. Needed for
+    // surplusShare specifically: pushing past the gap risks flipping who's richer in a single
+    // tick, which round-trips into oscillation/flicker between adjacent cells at high
+    // conductivity.
+    //
+    // surplusShare is divided by 4 (the max possible cardinal same-team neighbors) before
+    // being applied per edge -- unlike baseShare, which is naturally self-limiting per edge (a
+    // specific neighbor's gap can't exceed currentEnergy), surplus is the SAME value for every
+    // qualifying edge this cell has, so applying it undivided let a cell with 2+ poorer
+    // same-team neighbors pledge its *entire* surplus to each one simultaneously --
+    // overcommitting routinely (any solid blob interior has ~2 poorer cardinal neighbors on
+    // average once above target), not just the rare "several much-poorer neighbors at once"
+    // case the totalGive safety cap below was written for. Dividing by a fixed 4 -- rather
+    // than the giver's actual poorer-neighbor count, which would require reading the giver's
+    // neighbors too (a second ring of texture reads) -- keeps both sides of an edge computing
+    // the identical value from only their own 1-ring data, so conservation stays exact, at the
+    // cost of under-spending when a cell has fewer than 4 poorer neighbors.
+    //
+    // The giving side of each edge always uses its OWN conductivity/surplus, and since the
+    // receiver reads the giver's energy directly, "the giver's surplus" as computed by the
+    // receiver and "my surplus" as computed by the giver are the same value -- so a gain on
+    // one side always exactly matches a loss on the other, same conservation guarantee as
+    // before. Also tracks how much is given away separately so it can still be capped --
+    // defense in depth, should rarely trigger now that per-edge pushes are budgeted not to sum
+    // past a cell's own surplus. grossThroughput (the sum of what actually moved, both
+    // directions) is what drives this cell's own conductivity growth below.
     float netTransfer = 0.0;
     float totalGive = 0.0;
     float grossThroughput = 0.0;
     if (currentOwner != 0u) {
         float selfConductivity = decodeConductivity(self.g);
+        float satisfied = uEnergySatisfied[teamIdx];
+        float selfSurplus = max(currentEnergy - satisfied, 0.0);
+
         for (uint c = 0u; c < 4u; c++) {
             uint idx = CARDINAL_IDX[c];
             if (neighbors[idx].r != currentOwner) continue;
             float neighborEnergy = decodeEnergy(neighbors[idx].b, neighbors[idx].a);
             float neighborConductivity = decodeConductivity(neighbors[idx].g);
+            float neighborSurplus = max(neighborEnergy - satisfied, 0.0);
 
-            float share;
+            float share = 0.0;
             if (neighborEnergy > currentEnergy) {
-                // I receive, using the GIVER's (neighbor's) conductivity-boosted rate.
-                share = effectiveRate(uTransferRate[teamIdx], neighborConductivity) * (neighborEnergy - currentEnergy);
+                // I receive, using the GIVER's own conductivity/surplus, pre-divided across
+                // its up-to-4 cardinal edges (see comment above).
+                float rate = effectiveRate(uTransferRate[teamIdx], neighborConductivity);
+                float baseShare = rate * (neighborEnergy - currentEnergy);
+                float surplusShare = rate * neighborSurplus / 4.0;
+                share = min(max(baseShare, surplusShare), neighborEnergy - currentEnergy);
             } else if (neighborEnergy < currentEnergy) {
-                // I give, using MY OWN conductivity-boosted rate.
-                share = -effectiveRate(uTransferRate[teamIdx], selfConductivity) * (currentEnergy - neighborEnergy);
-            } else {
-                share = 0.0;
+                // I give, using MY OWN conductivity/surplus, pre-divided across my up-to-4
+                // cardinal edges.
+                float rate = effectiveRate(uTransferRate[teamIdx], selfConductivity);
+                float baseShare = rate * (currentEnergy - neighborEnergy);
+                float surplusShare = rate * selfSurplus / 4.0;
+                share = -min(max(baseShare, surplusShare), currentEnergy - neighborEnergy);
             }
 
             netTransfer += share;

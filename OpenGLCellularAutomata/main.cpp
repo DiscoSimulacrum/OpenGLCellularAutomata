@@ -26,8 +26,8 @@ const int NUM_TEAMS = 6;            //Number of competing slime colonies (must b
 const int MAX_TEAMS = 8;            //Size of the per-team uniform arrays in cellular.comp (matches its color palette)
 const float EXPAND_CHANCE = 0.08f;    //Action-chance multiplier when claiming unclaimed territory (combat itself is deterministic, no chance involved -- see cellular.comp)
 
-const float HOME_SOURCE_STRENGTH = 40.0f;   //Energy/tick generated at each team's colony-center source
-const float FREE_SOURCE_STRENGTH = 25.0f;   //Energy/tick generated at each scattered neutral source
+const float HOME_SOURCE_STRENGTH = 100.0f;   //Energy/tick generated at each team's colony-center source
+const float FREE_SOURCE_STRENGTH = 60.0f;   //Energy/tick generated at each scattered neutral source
 const int NUM_FREE_SOURCES = 18;            //Count of scattered neutral energy sources placed across the map
 const float MIN_SOURCE_TO_BLOB_DIST = 75.0f;   //Placement rejection radius (px) around blob centers
 const float MIN_SOURCE_TO_SOURCE_DIST = 60.0f; //Placement rejection radius (px) between sources
@@ -35,7 +35,7 @@ const float MIN_SOURCE_TO_SOURCE_DIST = 60.0f; //Placement rejection radius (px)
 // Shared by every team -- no longer an archetype differentiator, just the shape of the
 // economy everyone plays within.
 const float ENERGY_CAPACITY = 1500.0f; //Max storable energy per cell, same for all teams
-const float UPKEEP_COST = 0.3f;       //Energy spent per tick just to stay alive, same for all teams
+const float UPKEEP_COST = 1.5f;       //Energy spent per tick just to stay alive, same for all teams
 
 // Reproduction's EXPECTED cost (see totalAttackSpend in cellular.comp) is startEnergy *
 // this multiplier, same for every team -- a team's reproductionWillingness (see SlimeClass
@@ -51,7 +51,7 @@ const float REPRODUCTION_COST_MULTIPLIER = 1.2f;
 // diffusion gradient. Shared by every team, not a per-archetype dial, same as the two
 // constants above. First-guess starting values -- expect to need empirical tuning.
 const float CONDUCTIVITY_DECAY = 0.02f; //Per-tick decay fraction (~35-tick half-life)
-const float CONDUCTIVITY_GAIN = 0.01f; //Scales this tick's throughput into conductivity growth (boosted 20x from 0.0005 -- first attempt showed no visible reinforcement)
+const float CONDUCTIVITY_GAIN = 0.005f; //Scales this tick's throughput into conductivity growth (boosted 20x from 0.0005 -- first attempt showed no visible reinforcement)
 const float CONDUCTIVITY_BOOST = 1.0f;   //Multiplier in effectiveRate; at max conductivity (4.0) this triples the effective sharing rate
 
 // Per-color profile: purely behavioral now (no stat archetypes like durability/burst damage --
@@ -63,6 +63,7 @@ const float CONDUCTIVITY_BOOST = 1.0f;   //Multiplier in effectiveRate; at max c
 struct SlimeClass {
     const char* name;
     float startEnergy;          // energy a newly-claimed cell begins with
+    float energySatisfied;      // target energy level cells push toward/shed surplus above, NOT a cap -- see cellular.comp's sharing section
     float transferRate;         // altruism
     float reproductionWillingness; // scales how often (not how much) a team attempts/succeeds at claiming unclaimed land -- see REPRODUCTION_COST_MULTIPLIER
     float aggressionFraction;   // damage dealt per hostile neighbor touched, and the cost of maintaining it
@@ -92,17 +93,29 @@ struct SlimeClass {
 // by any combination of upkeep, sharing, and combat damage -- there's no separate
 // "conquered" event or free energy grant on death; the vacated tile just gets recontested
 // through the normal reproduction path like any other empty cell.
-// Expander (aggressive reproduction + low aggression + moderate defense) empirically produced
-// the healthiest-looking results under the deterministic siege combat model -- the other five
-// were pulled ~65% of the way toward its transferRate/reproductionWillingness/aggression/
-// defense values below, keeping just enough spread for identity rather than full duplicates.
+// Previously all six were pulled ~65% of the way toward Expander's dial values, which left
+// them as minor variations on one archetype rather than genuinely different strategies. This
+// pass pushes each team hard toward a distinct corner of the behavior space instead -- wide
+// spread on every dial (transfer 0.01-0.15, reproductionWillingness 0.9-2.2, aggression
+// 0.04-0.35, defense 0.06-0.45) so the archetypes actually play differently: a fast fragile
+// land-grabber, a trunk-line-building networker, a glass-cannon brawler, a turtle that barely
+// expands but is nearly unkillable once dug in, an all-around aggressive conqueror, and a
+// reckless fanatic that out-aggros and out-breeds everyone at the cost of almost no defense.
+//
+// energySatisfied (added alongside the surplus-based sharing model in cellular.comp) also
+// varies per team now: how much a team wants banked before it starts pushing surplus onward
+// doubles as a hoarding/generosity dial, so it's set to roughly track each archetype's
+// personality -- generous networkers and fast expanders keep little (400-450), the turtle
+// keeps the most of anyone (1100), and the rest fall in between.
+//
+// Still unvalidated against real matches -- expect another round of tuning once observed.
 const SlimeClass DEFAULT_TEAM_CLASSES[NUM_TEAMS] = {
-    { "Expander",    600.0f, 0.03f, 2.0f, 0.08f, 0.15f }, // spreads into empty land fast, doesn't share, doesn't fight, turtles a bit if touched
-    { "Cooperator",  600.0f, 0.05f, 1.4f, 0.08f, 0.15f }, // shares a bit more than most, doesn't fight much, leans on allies + modest defense
-    { "Raider",      600.0f, 0.04f, 1.4f, 0.19f, 0.12f }, // still the most aggressive of the six, but far less of a glass cannon than before
-    { "Diplomat",    600.0f, 0.04f, 1.7f, 0.08f, 0.17f }, // grows and shares peacefully, avoids fights, relies on defense to survive contact
-    { "Warlord",     600.0f, 0.04f, 1.8f, 0.17f, 0.13f }, // expands and fights hard, moderate defense
-    { "Zealot",      600.0f, 0.04f, 1.4f, 0.17f, 0.15f }, // doesn't expand as eagerly as Expander, still leans aggressive
+    { "Expander",    300.0f, 450.0f,  0.01f, 2.2f, 0.05f, 0.10f }, // blitzes into empty land faster than anyone, invests almost nothing in combat either way -- fast but fragile alone
+    { "Cooperator",  300.0f, 400.0f,  0.08f, 1.2f, 0.05f, 0.20f }, // heavy altruism to drive conductivity trunk-lines (see cellular.comp), modest defense, avoids fights, wins through network efficiency
+    { "Raider",      300.0f, 700.0f,  0.02f, 1.3f, 0.35f, 0.08f }, // the glass-cannon brawler: highest aggression of the six, but nearly undefended -- devastating on offense, dies fast if it doesn't keep winning
+    { "Diplomat",    300.0f, 1100.0f, 0.03f, 0.9f, 0.04f, 0.45f }, // barely expands and rarely fights -- hoards the most energy of anyone behind the highest defense of the six, wins by simply outlasting everyone else
+    { "Warlord",     300.0f, 650.0f,  0.04f, 1.8f, 0.25f, 0.22f }, // the all-around threat: high reproduction, high aggression, and real defense to back it up -- no single glaring weakness
+    { "Zealot",      300.0f, 500.0f,  0.02f, 2.0f, 0.30f, 0.06f }, // reckless fanatic: expands and attacks almost as hard as the two specialists combined, but defense is nearly nonexistent
 };
 
 // Mutable at runtime: starts as a copy of DEFAULT_TEAM_CLASSES, optionally overwritten by
@@ -190,6 +203,14 @@ private:
     bool quiet = false; // suppresses startup/status console output (used for batch/headless runs)
     std::vector<Color> teamColors; // team index -> resolved color from this run's chosen palette
 
+    // CPU-side copy of the source map (see initializeGrid), kept around so
+    // checkEnergyConservation() can sum source income without a second GPU readback of the
+    // never-changing sourceMapTexture every poll.
+    std::vector<float> sourceMapCPU;
+    double lastTotalEnergy = 0.0;
+    uint32_t lastEnergyCheckFrame = 0;
+    bool energyBaselineSet = false; // false until the first checkEnergyConservation() call, so it doesn't report a bogus delta against frame 0
+
     float quadVertices[24] = {
         -1.0f,  1.0f, 0.0f, 1.0f,  -1.0f, -1.0f, 0.0f, 0.0f,  1.0f, -1.0f, 1.0f, 0.0f,
         -1.0f,  1.0f, 0.0f, 1.0f,   1.0f, -1.0f, 1.0f, 0.0f,  1.0f,  1.0f, 1.0f, 1.0f
@@ -265,6 +286,70 @@ public:
         return counts;
     }
 
+    // Sums stored energy across every claimed cell, plus what this tick's total source
+    // income would be (sum of sourceMapCPU over currently-claimed source tiles only --
+    // an unclaimed source tile generates nothing, see cellular.comp's sourceGain). Forces
+    // a GPU sync like countTerritory(), so callers should only do this periodically.
+    struct EnergyStats {
+        double totalEnergy = 0.0;
+        double sourceIncomePerTick = 0.0;
+    };
+
+    EnergyStats computeEnergyStats() {
+        GLuint currentTex = useTextureA ? textureA : textureB;
+        std::vector<uint16_t> cellData(width * height * 4);
+        glBindTexture(GL_TEXTURE_2D, currentTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, cellData.data());
+
+        EnergyStats stats;
+        for (int i = 0; i < width * height; i++) {
+            if (cellData[i * 4 + 0] == 0) continue; // unclaimed: no stored energy, no source income
+            uint16_t whole = cellData[i * 4 + 2];
+            uint16_t frac = cellData[i * 4 + 3];
+            stats.totalEnergy += (double)whole + (double)frac / 256.0;
+            stats.sourceIncomePerTick += sourceMapCPU[i];
+        }
+        return stats;
+    }
+
+    // Flags growth in total grid energy that outruns what claimed source tiles could have
+    // legitimately produced over the elapsed ticks. maxSourceGrowth is an approximation --
+    // it assumes this tick's source income (which source tiles happen to be claimed right
+    // now) held roughly steady across the whole interval, rather than re-measuring every
+    // tick, since that would force a GPU sync every step().
+    //
+    // Reproduction is a SECOND, intentional source of new energy: a successful land claim
+    // mints a fresh startEnergy for the new cell, not transferred from anywhere. It's only a
+    // net sink on average -- attackers' totalAttackSpend is calibrated to exceed it (see
+    // REPRODUCTION_COST_MULTIPLIER) -- so a burst of successful claims can legitimately push
+    // measured growth above maxSourceGrowth without indicating a bug. Treat isolated
+    // overages as expected variance; a persistent or large overage is the signal worth
+    // investigating (e.g. in the sharing safety-cap in cellular.comp, the one place energy
+    // conservation is an accepted approximation rather than exact).
+    void checkEnergyConservation() {
+        EnergyStats stats = computeEnergyStats();
+
+        if (energyBaselineSet) {
+            uint32_t ticksElapsed = simFrame - lastEnergyCheckFrame;
+            double measuredGrowth = stats.totalEnergy - lastTotalEnergy;
+            double maxSourceGrowth = stats.sourceIncomePerTick * ticksElapsed;
+
+            std::cout << "Total energy: " << (long long)stats.totalEnergy
+                       << " (" << (measuredGrowth >= 0 ? "+" : "") << (long long)measuredGrowth
+                       << " over " << ticksElapsed << " ticks, max from sources: "
+                       << (long long)maxSourceGrowth << ")";
+            if (measuredGrowth > maxSourceGrowth) {
+                std::cout << "  [!] exceeds source bound by "
+                           << (long long)(measuredGrowth - maxSourceGrowth);
+            }
+            std::cout << std::endl;
+        }
+
+        lastTotalEnergy = stats.totalEnergy;
+        lastEnergyCheckFrame = simFrame;
+        energyBaselineSet = true;
+    }
+
     // Prints FPS plus a color-coded per-team cell count. Called periodically (every
     // STATS_POLL_INTERVAL) during an interactive run.
     void printStats(double fps) {
@@ -275,6 +360,8 @@ public:
             std::cout << "  " << ansiColor(teamColors[i]) << TEAM_CLASSES[i].name << ANSI_RESET
                        << ": " << counts[i + 1] << std::endl;
         }
+
+        checkEnergyConservation();
     }
 
     // Prints a single machine-parseable line with each team's final territory count, in
@@ -395,6 +482,7 @@ private:
         glUniform1f(glGetUniformLocation(computeProgram, "uConductivityBoost"), CONDUCTIVITY_BOOST);
 
         float startEnergy[MAX_TEAMS] = {};
+        float energySatisfied[MAX_TEAMS] = {};
         float transferRate[MAX_TEAMS] = {};
         float reproductionWillingness[MAX_TEAMS] = {};
         float aggressionFraction[MAX_TEAMS] = {};
@@ -403,6 +491,7 @@ private:
         for (int i = 0; i < NUM_TEAMS; i++) {
             const SlimeClass& c = TEAM_CLASSES[i];
             startEnergy[i] = c.startEnergy;
+            energySatisfied[i] = c.energySatisfied;
             transferRate[i] = c.transferRate;
             reproductionWillingness[i] = c.reproductionWillingness;
             aggressionFraction[i] = c.aggressionFraction;
@@ -410,6 +499,7 @@ private:
         }
 
         glUniform1fv(glGetUniformLocation(computeProgram, "uStartEnergy"), MAX_TEAMS, startEnergy);
+        glUniform1fv(glGetUniformLocation(computeProgram, "uEnergySatisfied"), MAX_TEAMS, energySatisfied);
         glUniform1fv(glGetUniformLocation(computeProgram, "uTransferRate"), MAX_TEAMS, transferRate);
         glUniform1fv(glGetUniformLocation(computeProgram, "uReproductionWillingness"), MAX_TEAMS, reproductionWillingness);
         glUniform1fv(glGetUniformLocation(computeProgram, "uAggressionFraction"), MAX_TEAMS, aggressionFraction);
@@ -576,6 +666,8 @@ private:
 
         glBindTexture(GL_TEXTURE_2D, sourceMapTexture);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_FLOAT, sourceData.data());
+
+        sourceMapCPU = std::move(sourceData); // kept for checkEnergyConservation(); sourceData is dead after this
     }
 
     void setupQuad() {
@@ -603,9 +695,9 @@ struct RunConfig {
 //   --ticks <N>   Run N simulation ticks headlessly (no window/rendering/framerate limit),
 //                 print final per-team territory counts as "RESULT:c1,c2,...,cN" to stdout,
 //                 then exit. Omit this flag to run the normal interactive fullscreen mode.
-//   --stats <csv> Comma-separated list of NUM_TEAMS * 5 floats (startEnergy, transferRate,
-//                 reproductionWillingness, aggressionFraction, defenseFraction, repeated per
-//                 team in team order) overriding the compiled-in defaults. Lets an external
+//   --stats <csv> Comma-separated list of NUM_TEAMS * 6 floats (startEnergy, energySatisfied,
+//                 transferRate, reproductionWillingness, aggressionFraction, defenseFraction,
+//                 repeated per team in team order) overriding the compiled-in defaults. Lets an external
 //                 evolutionary-algorithm driver feed in candidate parameter sets without
 //                 recompiling. Works in either mode. (ENERGY_CAPACITY/UPKEEP_COST/REPRODUCTION_
 //                 COST_MULTIPLIER are shared globals, not per-team, so they aren't part of
@@ -626,19 +718,20 @@ RunConfig parseArgs(int argc, char** argv) {
             std::string token;
             while (std::getline(ss, token, ',')) values.push_back(std::stof(token));
 
-            if ((int)values.size() != NUM_TEAMS * 5) {
-                std::cerr << "--stats expects " << (NUM_TEAMS * 5) << " comma-separated values, got "
+            if ((int)values.size() != NUM_TEAMS * 6) {
+                std::cerr << "--stats expects " << (NUM_TEAMS * 6) << " comma-separated values, got "
                           << values.size() << std::endl;
                 std::exit(1);
             }
 
             for (int t = 0; t < NUM_TEAMS; t++) {
-                const float* v = &values[t * 5];
+                const float* v = &values[t * 6];
                 TEAM_CLASSES[t].startEnergy             = v[0];
-                TEAM_CLASSES[t].transferRate             = v[1];
-                TEAM_CLASSES[t].reproductionWillingness  = v[2];
-                TEAM_CLASSES[t].aggressionFraction       = v[3];
-                TEAM_CLASSES[t].defenseFraction          = v[4];
+                TEAM_CLASSES[t].energySatisfied          = v[1];
+                TEAM_CLASSES[t].transferRate             = v[2];
+                TEAM_CLASSES[t].reproductionWillingness  = v[3];
+                TEAM_CLASSES[t].aggressionFraction       = v[4];
+                TEAM_CLASSES[t].defenseFraction          = v[5];
             }
         }
     }
