@@ -1,73 +1,205 @@
 #version 430
+#extension GL_ARB_gpu_shader_int64 : require
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+// Two-phase tick (design doc §12): this file is compiled TWICE into two separate programs --
+// once plain (Phase A: "propose", see main.cpp's phaseAProgram), once with CA_PHASE_B defined
+// (Phase B: "resolve", phaseBProgram). Phase A reads only the persisted, start-of-tick state
+// and publishes intents (below); Phase B reads that SAME persisted state plus Phase A's now-
+// frozen intents (barrier-ordered between the two dispatches, see main.cpp's step()) and
+// writes the final new state. Sharing one file rather than two keeps the extensive shared
+// helpers/uniforms/documentation below in exactly one place instead of needing to stay
+// hand-synced across files.
 layout(binding = 0, rgba16ui) uniform readonly uimage2D inputImage;
-layout(binding = 1, rgba16ui) uniform writeonly uimage2D outputImage;
-layout(binding = 2, r32f) uniform readonly image2D uSourceMap; // static energy-generation strength per cell; never changes after map generation
+// Per-direction conductivity: R=N, G=E, B=S, A=W (see CONDUCTIVITY_CHANNEL below), each a
+// compact fixed-point scalar in [0,4] -- same encoding the old single-scalar version used,
+// just replicated per direction (see decodeConductivity/encodeConductivity). Ping-ponged in
+// lockstep with inputImage/outputImage (same useTextureA flag drives both pairs).
+layout(binding = 2, rgba16ui) uniform readonly uimage2D inputConductivity;
 
-// Cell layout: R = team id (0 = unclaimed), G = conductivity (see decodeConductivity/
-// encodeConductivity), B = energy integer part, A = energy fractional part (1/256ths) --
-// see decodeEnergy/encodeEnergy. A cell's stored energy is both its defensive reserve and
-// the source of its attack power, replacing HP/attack/age-growth entirely. A cell dies only
-// one way: it runs out of energy (starvation) -- whether that's from upkeep, a bad trade in
-// sharing, or combat damage inflicted by hostile neighbors makes no difference, they all
-// just subtract from the same pool. There's no separate "conquered" event or age/lifespan
-// mortality -- a cell that starves reverts to unclaimed land and gets recontested through
-// the normal reproduction path like any other empty tile. Conductivity is a per-cell memory
-// of recent energy throughput that reinforces itself over time (see effectiveRate below),
-// letting supply routes between a source and an active frontier organize into "trunk lines"
-// rather than staying a plain, undirected diffusion gradient.
+// Intent buffer (design doc §4): single-buffered, not persisted across ticks -- Phase A
+// overwrites every texel every tick before the mid-tick barrier makes it visible to Phase B,
+// so there's nothing to ping-pong. intentTransferTex holds each cardinal direction's
+// give-amount (energyFP), channel-mapped via the existing CONDUCTIVITY_CHANNEL table so
+// Phase B's receiver-side lookup can reuse CONDUCTIVITY_CHANNEL/OPPOSITE_CARDINAL verbatim.
+// intentReproBidTex holds a single direction-independent reproduction bid per cell (a
+// candidate bids the same amount toward every empty Moore-neighbor it has, so one value
+// suffices) -- encoded as (bidValue+1), with raw 0 meaning "not bidding," to disambiguate
+// from a legitimately-zero bid (possible if a team's reproductionWillingness is 0).
+#ifdef CA_PHASE_B
+layout(binding = 1, rgba16ui) uniform writeonly uimage2D outputImage;
+layout(binding = 3, rgba16ui) uniform writeonly uimage2D outputConductivity;
+layout(binding = 4, rgba32ui) uniform readonly uimage2D intentTransferTex;
+layout(binding = 5, r32ui) uniform readonly uimage2D intentReproBidTex;
+#else
+layout(binding = 4, rgba32ui) uniform writeonly uimage2D intentTransferTex;
+layout(binding = 5, r32ui) uniform writeonly uimage2D intentReproBidTex;
+#endif
+
+// Running total of energy destroyed (not transferred, not banked -- genuinely gone) since
+// the run started: upkeep, combat damage, enemy-contact maintenance tax, capacity overflow,
+// reproduction overhead, and transfer loss so far. Same energyFP scale as every other energy
+// quantity in this file (see ENERGY_SCALE below).
+//
+// Split across two 32-bit words rather than one uint64_t counter: a single uint32 overflows
+// fast at this project's scale (upkeep alone across a grid's worth of claimed cells
+// accumulates tens of millions of energyFP units every few hundred ticks), but 64-bit
+// ATOMICS need GL_ARB_shader_atomic_int64 specifically -- a different, less universally
+// supported extension than the GL_ARB_gpu_shader_int64 this file already requires for
+// mulShift's multiply-shift (that one only needs int64 as a scalar TYPE, not atomic support
+// on it). Standard lock-free carry-propagation instead: atomicAdd on the low word returns its
+// value from BEFORE this add, so each invocation can tell -- from data only it just observed
+// atomically -- whether ITS OWN add wrapped the low word, and bump the high word exactly once
+// if so. Correct under arbitrary concurrent interleaving from every other invocation, since
+// the overflow check is always against the true pre-add value.
+//
+// injectedLo/Hi is the companion running total on the other side of the ledger: every
+// energyFP unit actually credited to a claimed cell via harvest, plus every winning child's
+// startEnergy grant on a successful reproduction (see reproDebit) -- tracked unconditionally
+// rather than assumed to net out against the parent's debit, since natural insolvency means
+// the parent's payment isn't always guaranteed to cover it in full (see reproDebit's comment).
+// Together with wasteLo/Hi and the fixed initial cell energy the host computed once at
+// grid-init time, this is what makes the invariant in main.cpp's checkEnergyConservation() an
+// exact equality rather than an estimated bound:
+// Σcells + Σdeposits == initialCellEnergy + injected - waste.
+layout(std430, binding = 0) buffer LedgerBuffer {
+    uint wasteLo;
+    uint wasteHi;
+    uint injectedLo;
+    uint injectedHi;
+    uint claimCount; // diagnostic: successful reproductions this run so far (not energy-scaled, plain count -- claims are far rarer than energy units, no overflow risk in any reasonable session)
+};
+
+// Adds a non-negative amount of destroyed energy (already in energyFP units) to wasteLo/Hi.
+void addWaste(int amountFP) {
+    if (amountFP <= 0) return;
+    uint amt = uint(amountFP);
+    uint prevLo = atomicAdd(wasteLo, amt);
+    if (prevLo > 0xFFFFFFFFu - amt) atomicAdd(wasteHi, 1u);
+}
+
+// Adds a non-negative amount of newly-injected energy (already in energyFP units) to
+// injectedLo/Hi. Same lock-free carry-propagation as addWaste -- see its comment above.
+void addInjected(int amountFP) {
+    if (amountFP <= 0) return;
+    uint amt = uint(amountFP);
+    uint prevLo = atomicAdd(injectedLo, amt);
+    if (prevLo > 0xFFFFFFFFu - amt) atomicAdd(injectedHi, 1u);
+}
+
+// Cell layout: R = team id -- 0 = unclaimed, 1..MAX_TEAMS = real teams, 254 = DEPOSIT_ID (a
+// dead cell's leftover energy, harvestable, drains and reverts to unclaimed once exhausted),
+// 255 = SOURCE_ID (a static, never-depleting energy generator; formerly a separate texture,
+// now just another grid entity). G = age (ticks since this cell was last claimed; reset to 0
+// on claim/reclaim/death -- currently unread by any mechanic, plumbing only). B/A together
+// pack one plain 32-bit integer energy count (energyFP, B = high 16 bits, A = low 16 bits) --
+// not a whole/fraction split, just a wider unit: see ENERGY_SCALE below for why a flat
+// integer needs a finer base unit than "1" to avoid a real precision regression. For a
+// source/deposit cell, the energy field holds its strength/remaining pool instead of a
+// team's banked energy. A real team's stored energy is both its defensive reserve and the
+// source of its attack power, replacing HP/attack entirely. A cell dies only one way: it
+// runs out of energy (starvation) -- whether that's from upkeep, a bad trade in sharing, or
+// combat damage inflicted by hostile neighbors makes no difference, they all just subtract
+// from the same pool. There's no separate "conquered" event or age/lifespan mortality -- a
+// cell that starves reverts to a deposit (see the ledger section below), not straight to
+// unclaimed.
+//
+// NOTE: the single-scalar conductivity/"trunk line" mechanic that used to live in the G
+// channel has been removed as a transitional step -- it returns as a proper per-direction
+// mechanic on a separate texture layer in a later pass. Sharing below currently uses each
+// team's flat uTransferRate with no boost.
 const int MAX_TEAMS = 8;
+const uint DEPOSIT_ID = 254u;
+const uint SOURCE_ID = 255u;
+
+// energyFP is a plain integer count in units of 1/256th of a "display" energy unit (e.g.
+// what used to print as "300" is now 76800 energyFP). This is exactly the resolution the
+// project's OLD whole+fractional-channel scheme already had -- rescaling by this factor
+// reproduces that same precision floor as a flat integer instead of a whole/frac split, so
+// switching representations is resolution-NEUTRAL rather than a silent nerf to low-rate
+// teams (a raw 1-unit-resolution flat integer would truncate every sub-1.0 trickle transfer
+// to 0 forever, exactly the problem the old fractional channel existed to avoid). All
+// energy-valued uniforms below (uEnergyCapacity, uUpkeepCost, uStartEnergy, uEnergySatisfied)
+// arrive already scaled by this factor from the host -- see main.cpp's uploadTeamClasses().
+const int ENERGY_SCALE = 256;
+
+// Q16.16 fixed-point: a "rate" value r in [0,~2] is represented as uint(round(r * 65536)),
+// so 1.0 (100%) is exactly 65536u. mulShift applies such a rate to an energyFP amount without
+// ever round-tripping through float, so two invocations computing "the same" quantity from
+// the same inputs are GUARANTEED bit-identical -- unlike float ops, which aren't guaranteed
+// bit-identical across two different invocations doing the same computation with any operand
+// reordering, exactly the failure mode that would silently break the give/receive symmetry
+// this whole ledger design depends on. The uint64_t intermediate is required: energyFP can
+// reach several hundred thousand and rateQ16 can exceed 65536 (rates above 1.0, e.g.
+// reproductionCostMultiplier or reproductionWillingness-adjacent quantities), so their
+// product can exceed uint32 range.
+uint mulShift(uint x, uint rateQ16) {
+    return uint((uint64_t(x) * uint64_t(rateQ16)) >> 16u);
+}
 
 uniform uint uFrame;          // frame counter, used to seed the PRNG
-uniform float uExpandChance;  // action-chance multiplier when claiming unclaimed territory
 
 // Shared by every team -- no longer a per-archetype differentiator. What now varies between
 // teams is purely behavioral: how altruistic (transferRate), reproductive, and aggressive
-// each one is.
-uniform float uEnergyCapacity;
-uniform float uUpkeepCost;
-uniform float uReproductionCostMultiplier; // shared by every team: the EXPECTED energy cost of one successful land claim is startEnergy * this, regardless of a team's reproductionWillingness (see totalAttackSpend)
+// each one is. Energy-valued (energyFP, scaled by ENERGY_SCALE on the host).
+uniform int uEnergyCapacity;
+uniform int uUpkeepCost;
+// Rate-valued (Q16.16, see mulShift): a successful land claim costs its parent
+// startEnergy * this (C_birth, see reproDebit), regardless of a team's reproductionWillingness.
+uniform uint uReproductionCostMultiplier;
+// Rate-valued (Q16.16): fraction of a committed transfer the receiver actually gets; the rest
+// is real loss -> waste, not rounding.
+uniform uint uTransferEfficiency;
 
 // Conductivity reinforcement dynamics (shared by every team, like the economy constants
-// above -- a property of the world's physics, not a per-team behavioral dial).
+// above -- a property of the world's physics, not a per-team behavioral dial). Conductivity
+// itself is explicitly NOT part of the conserved energy ledger (it's a decaying memory of
+// throughput, not a quantity of energy), so these stay float rather than Q16.16/energyFP --
+// see effectiveRateQ16 below for how a float boost factor still only ever touches energy
+// through an exact integer multiply.
 uniform float uConductivityDecay;  // per-tick decay fraction applied to existing conductivity
 uniform float uConductivityGain;   // scales this tick's throughput into conductivity growth
-uniform float uConductivityBoost;  // multiplier in effectiveRate; at max conductivity (4.0), scales the effective share rate by (1 + boost*4.0)
+uniform float uConductivityBoost;  // multiplier in effectiveRateQ16; at max conductivity (4.0), scales the effective share rate by (1 + boost*4.0)
 
 // Per-team behavior. transferRate = altruism: the base rate at which a cell pushes/pulls
-// energy to/from a poorer/richer cardinal (N/W/E/S) same-team neighbor, before conductivity
-// reinforcement (see effectiveRate) -- letting supply flow from a source out to the frontier,
-// and letting whichever paths carry the most sustained flow become progressively better
-// conduits. energySatisfied is the target level a cell tries to hold, NOT its maximum: a cell
-// above its target pushes that surplus onward at full rate regardless of how small the local
-// gap to a specific neighbor is, rather than throttling down once neighbors are close in
-// value the way plain diffusion does (see the sharing section below for why).
+// energy to/from a poorer/richer cardinal (N/W/E/S) same-team neighbor -- letting supply
+// flow from a source out to the frontier. energySatisfied is the target level a cell tries to
+// hold, NOT its maximum: a cell above its target pushes that surplus onward at full rate
+// regardless of how small the local gap to a specific neighbor is, rather than throttling
+// down once neighbors are close in value the way plain diffusion does (see the sharing
+// section below for why).
 //
-// aggressionFraction is how much damage a cell deals to each
-// hostile neighbor it touches: damage_i = thatNeighbor'sEnergy * aggressionFraction, summed
-// across every hostile neighbor, deterministically, every tick -- no RNG, no coin flip. It
-// also still sets the flat per-tick cost of maintaining that aggression (see totalAttackSpend
-// below), which is a separate ledger from the damage dealt: the attacker burns its own energy
-// independently of how much damage lands, rather than one funding the other. defenseFraction
-// is the mirror image: a percentage reduction applied to all incoming combat damage this cell
-// takes (capped well below 1.0 so it can never fully negate or invert into healing), at the
-// same flat per-tick cost as aggression. reproductionWillingness plays the analogous role for
-// claiming unclaimed land: it multiplies the flat uExpandChance odds of success each tick,
-// so an eager team (>1.0) succeeds sooner
-// on average and a reluctant team (<1.0) succeeds later -- but because the per-tick cost
-// scales with that same effective chance (see totalAttackSpend below), the EXPECTED total
-// cost paid before one success occurs is always startEnergy * uReproductionCostMultiplier
-// (the shared global above), regardless of willingness. That keeps startEnergy and
-// reproduction's economics perfectly even across teams; only how OFTEN a team reproduces
-// differs.
-uniform float uStartEnergy[MAX_TEAMS];             // energy a newly-claimed cell begins with
-uniform float uEnergySatisfied[MAX_TEAMS];         // target energy level this team's cells push toward/shed surplus above -- see sharing section below
-uniform float uTransferRate[MAX_TEAMS];            // altruism
-uniform float uReproductionWillingness[MAX_TEAMS]; // multiplies uExpandChance's odds of claiming unclaimed territory
-uniform float uAggressionFraction[MAX_TEAMS];      // damage dealt per hostile neighbor, and cost of maintaining it
-uniform float uDefenseFraction[MAX_TEAMS];         // percentage reduction applied to incoming combat damage
+// aggressionFraction is how much damage a cell deals to each hostile neighbor it touches:
+// damage_i = thatNeighbor'sEnergy * aggressionFraction, summed across every hostile neighbor,
+// deterministically, every tick -- no RNG, no coin flip. It also still sets the flat per-tick
+// cost of maintaining that aggression (see enemyContactTax below), which is a separate ledger
+// from the damage dealt: the attacker burns its own energy independently of how much damage
+// lands, rather than one funding the other. defenseFraction is the mirror image: a percentage
+// reduction applied to all incoming combat damage this cell takes (capped well below 1.0 so
+// it can never fully negate or invert into healing), at the same flat per-tick cost as
+// aggression. reproductionWillingness plays the analogous role for claiming unclaimed land,
+// but under the two-phase bid model (design doc §12.3, see Phase A's main() above) it scales
+// BID STRENGTH rather than roll odds: a candidate's published bid is
+// currentEnergy * reproductionWillingness, so an eager team (>1.0) out-bids competitors at
+// the same energy level and wins contested tiles more reliably, not just more often over
+// time. Every WIN still costs the SAME startEnergy * uReproductionCostMultiplier (C_birth,
+// see reproDebit below) regardless of willingness, keeping startEnergy and reproduction's
+// per-win economics perfectly even across teams; only how aggressively a team competes for
+// contested land differs.
+//
+// uStartEnergy/uEnergySatisfied are energyFP (scaled by ENERGY_SCALE). uTransferRate/
+// uAggressionFraction/uDefenseFraction are Q16.16 rates (see mulShift). uReproductionWillingness
+// stays float -- it only ever scales a bid magnitude, computed once by the bidding cell's own
+// Phase-A invocation and then published as an integer (see Phase A's main()), never
+// recomputed by a second invocation -- so there's no cross-invocation float-determinism
+// hazard to avoid by converting it.
+uniform int uStartEnergy[MAX_TEAMS];
+uniform int uEnergySatisfied[MAX_TEAMS];
+uniform uint uTransferRate[MAX_TEAMS];
+uniform float uReproductionWillingness[MAX_TEAMS];
+uniform uint uAggressionFraction[MAX_TEAMS];
+uniform uint uDefenseFraction[MAX_TEAMS];
 
 // Small integer hash (Wang hash variant) for a decorrelated pseudo-random stream.
 uint hash(uint x) {
@@ -85,37 +217,19 @@ float randFloat(ivec2 coord, uint frame, uint salt) {
     return float(h) / 4294967295.0;
 }
 
-// Combines the integer (B) and fractional (A, in 1/256ths) channels into a float energy
-// value. The fractional channel exists so slow trickle transfers (well under 1.0/tick for
-// low-transferRate teams) accumulate correctly instead of being truncated to 0 forever.
-float decodeEnergy(uint whole, uint frac) {
-    return float(whole) + float(frac) / 256.0;
+// Packs a cell's B/A channels (high/low 16 bits) into one energyFP integer.
+int energyOf(uvec4 cell) {
+    return int((cell.b << 16) | cell.a);
 }
 
-void encodeEnergy(float energy, out uint whole, out uint frac) {
-    float e = max(energy, 0.0);
-    whole = uint(min(floor(e), 65535.0));
-    frac = uint(clamp(fract(e) * 256.0, 0.0, 255.0));
-}
-
-// Conductivity is a single 16-bit fixed-point value (not split whole+fractional like energy)
-// covering the range [0, 4.0]. Unlike energy, it's a slowly-evolving decay-then-accumulate
-// memory rather than a value where sub-1.0 absolute amounts get permanently lost each tick,
-// so a single scaled channel is precise enough (~0.00024 resolution).
-const float CONDUCTIVITY_SCALE = 16383.0;
-
-float decodeConductivity(uint raw) {
-    return float(raw) / CONDUCTIVITY_SCALE;
-}
-
-uint encodeConductivity(float c) {
-    return uint(clamp(c, 0.0, 4.0) * CONDUCTIVITY_SCALE);
-}
-
-// Boosts a team's base sharing rate by how conductive the giving cell currently is -- a cell
-// that has recently relayed a lot of energy becomes a progressively better conduit.
-float effectiveRate(float baseRate, float conductivity) {
-    return baseRate * (1.0 + uConductivityBoost * conductivity);
+// Splits an energyFP integer back into the B/A (high/low 16 bits) channel pair for storage.
+// Values are always non-negative and well under 32 bits at this project's scale (capacity is
+// ENERGY_CAPACITY*ENERGY_SCALE, nowhere near the ~4 billion a uint32 pair can hold), so no
+// overflow handling is needed here.
+void packEnergy(int energyFP, out uint hi, out uint lo) {
+    uint fp = uint(max(energyFP, 0));
+    hi = (fp >> 16) & 0xFFFFu;
+    lo = fp & 0xFFFFu;
 }
 
 const ivec2 OFFSETS[8] = ivec2[](
@@ -128,6 +242,195 @@ const ivec2 OFFSETS[8] = ivec2[](
 // sharing only considers these, not the 4 diagonals (combat/expansion still uses all 8).
 const uint CARDINAL_IDX[4] = uint[](1u, 3u, 4u, 6u);
 
+// Maps a CARDINAL_IDX slot (c, in N/W/E/S order) to its channel in the conductivity texture
+// (R=N, G=E, B=S, A=W -- a different order than CARDINAL_IDX, hence this separate table
+// rather than reusing one directly).
+const uint CONDUCTIVITY_CHANNEL[4] = uint[](0u, 3u, 1u, 2u); // N->R, W->A, E->G, S->B
+
+// Opposite cardinal slot (N<->S, W<->E) in CARDINAL_IDX's own indexing -- used when a cell is
+// RECEIVING on direction c, to look up the GIVER's conductivity in the direction pointing
+// back at the receiver (the direction the energy is actually flowing), not the receiver's own
+// direction toward the giver.
+const uint OPPOSITE_CARDINAL[4] = uint[](3u, 2u, 1u, 0u);
+
+// Conductivity is a compact fixed-point value (not split whole+fractional like energy)
+// covering the range [0, 4.0]. Unlike energy, it's a slowly-evolving decay-then-accumulate
+// memory rather than a value where sub-1.0 absolute amounts get permanently lost each tick,
+// so this resolution (~0.00024) is precise enough.
+const float CONDUCTIVITY_SCALE = 16383.0;
+
+float decodeConductivity(uint raw) {
+    return float(raw) / CONDUCTIVITY_SCALE;
+}
+
+uint encodeConductivity(float c) {
+    return uint(clamp(c, 0.0, 4.0) * CONDUCTIVITY_SCALE);
+}
+
+// Boosts a Q16.16 base rate by how conductive the giving cell currently is in this specific
+// direction -- a cell that's recently relayed a lot of flow along this edge becomes a
+// progressively better conduit for it. The boost factor itself is computed in float
+// (conductivity is explicitly outside the conserved energy ledger -- see the design doc's
+// own "conductivity is not conserved, so float is fine here"), but the result is clamped back
+// to <=65536 (100%) before it ever reaches mulShift, so the hard structural bound on
+// transfer commitments (see the sharing section in main()) still holds even with boost
+// applied -- an unclamped boost could otherwise push the effective rate above 100%, which
+// would reopen exactly the over-commit risk that bound exists to close.
+uint effectiveRateQ16(uint baseRateQ16, float conductivity) {
+    float boosted = float(baseRateQ16) * (1.0 + uConductivityBoost * conductivity);
+    return min(uint(max(boosted, 0.0)), 65536u);
+}
+
+#ifndef CA_PHASE_B
+// Phase A ("propose"): publishes this cell's transfer give-intents and reproduction bid.
+// Both only depend on this cell's own (and, for transfer, its cardinal neighbors') persisted
+// start-of-tick state -- no cross-cell coordination needed for either. Transfer's formula is
+// IDENTICAL to what this project's give-side computation always was (see the design
+// rationale in Phase B's transfer section below) -- this migration only changes WHERE it's
+// computed and that the result gets published instead of independently recomputed by the
+// receiver.
+//
+// Reproduction bid = candidateEnergy * reproductionWillingness[team] (design doc §12.3:
+// "highest bid wins") -- direction-independent, so one published value covers every one of
+// this cell's Moore-neighbor contests; publishing 8 identical copies would be pure
+// redundancy. Computed here in float (reproductionWillingness is a per-team float dial), but
+// ONLY ONCE, by this cell's own invocation -- every other observer just reads the resulting
+// integer, never recomputes the multiply itself, which is what avoids the cross-invocation
+// float non-determinism mulShift's own comment warns about (two invocations independently
+// recomputing "energy*willingness" in float aren't guaranteed bit-identical). Encoded as
+// (bidValue+1) so raw==0 unambiguously means "not bidding" (disambiguates from a
+// legitimately-zero bid, possible if a team's reproductionWillingness is 0) -- a candidate
+// only bids at all if it can afford at least one C_birth; see resolveReproWinner/
+// countReproWins in Phase B for how bids resolve, and cellular.comp's ledger comment for why
+// there's no cap here on how many simultaneous wins get honored (natural insolvency instead).
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputImage);
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    uvec4 self = imageLoad(inputImage, coord);
+    uint currentOwner = self.r;
+
+    uvec4 give = uvec4(0u);
+    uint bidRaw = 0u;
+
+    if (currentOwner != 0u && currentOwner < DEPOSIT_ID) {
+        int currentEnergy = energyOf(self);
+        int teamIdx = int(currentOwner) - 1;
+        uvec4 selfCond = imageLoad(inputConductivity, coord);
+        uint rateClamped = min(uTransferRate[teamIdx], 65536u);
+        int satisfied = uEnergySatisfied[teamIdx];
+        int selfSurplus = max(currentEnergy - satisfied, 0);
+
+        for (uint c = 0u; c < 4u; c++) {
+            uint idx = CARDINAL_IDX[c];
+            ivec2 nc = coord + OFFSETS[idx];
+            nc.x = (nc.x + size.x) % size.x;
+            nc.y = (nc.y + size.y) % size.y;
+            uvec4 neighbor = imageLoad(inputImage, nc);
+            if (neighbor.r != currentOwner) continue; // not same team: no give intent this direction
+
+            int neighborEnergy = energyOf(neighbor);
+            if (neighborEnergy >= currentEnergy) continue; // not the giver on this edge
+
+            uint myChannel = CONDUCTIVITY_CHANNEL[c];
+            float myCond = decodeConductivity(selfCond[myChannel]);
+            uint rateQ16 = effectiveRateQ16(rateClamped, myCond);
+            int gap = currentEnergy - neighborEnergy;
+            int baseShare = int(mulShift(uint(gap), rateQ16)) / 4;
+            int surplusShare = int(mulShift(uint(selfSurplus), rateQ16)) / 4;
+            int sent = min(max(baseShare, surplusShare), gap);
+            give[myChannel] = uint(sent);
+        }
+
+        int cBirth = int(mulShift(uint(uStartEnergy[teamIdx]), uReproductionCostMultiplier));
+        if (currentEnergy >= cBirth) {
+            int bidVal = int(round(float(currentEnergy) * uReproductionWillingness[teamIdx]));
+            bidRaw = uint(max(bidVal, 0)) + 1u;
+        }
+    }
+
+    imageStore(intentTransferTex, coord, give);
+    imageStore(intentReproBidTex, coord, uvec4(bidRaw));
+}
+#else
+// Deterministic tie-break for reproduction contests: a pure function of (the tile being
+// resolved, which of its 8 slots the candidate sits in, the tick) -- identical regardless of
+// who's asking, so it can't reintroduce the cross-invocation-disagreement hazard this whole
+// migration exists to close.
+uint tieHash(ivec2 coordE, uint idx, uint frame) {
+    return hash(uint(coordE.x) * 92821u + uint(coordE.y) * 68917u + frame * 40699u + idx * 7919u);
+}
+
+// THE reproduction oracle: given only coordE, authoritatively resolves who wins it this
+// tick, over Phase A's now-frozen published bids. Called both by coordE's own Phase-B
+// invocation (the claimant loop below) AND by any candidate P checking "did I win this
+// specific empty neighbor" (countReproWins below) -- always over the exact same frozen
+// inputImage/intentReproBidTex data, so always the same answer. This is what makes the two
+// callers provably consistent by construction: neither is a simplified proxy for the other
+// anymore (that mismatch was the actual bug this migration fixes), they're the identical
+// computation.
+void resolveReproWinner(ivec2 coordE, ivec2 size, out uint winnerOwner, out uint winSlot) {
+    winnerOwner = 0u;
+    winSlot = 8u;
+    uint bestBid = 0u;
+    uint bestTie = 0u;
+    bool have = false;
+
+    for (uint idx = 0u; idx < 8u; idx++) {
+        ivec2 nc = coordE + OFFSETS[idx];
+        nc.x = (nc.x + size.x) % size.x;
+        nc.y = (nc.y + size.y) % size.y;
+
+        uint nOwner = imageLoad(inputImage, nc).r;
+        if (nOwner == 0u || nOwner >= DEPOSIT_ID) continue;
+
+        uint raw = imageLoad(intentReproBidTex, nc).r;
+        if (raw == 0u) continue; // not bidding (see Phase A's encoding comment above)
+        uint bidVal = raw - 1u;
+
+        uint tie = tieHash(coordE, idx, uFrame);
+        if (!have || bidVal > bestBid || (bidVal == bestBid && tie > bestTie)) {
+            bestBid = bidVal;
+            bestTie = tie;
+            winnerOwner = nOwner;
+            winSlot = idx;
+            have = true;
+        }
+    }
+}
+
+// Tallies, from coordP's own 1-ring, how many of coordP's empty Moore-neighbors it actually
+// wins this tick -- unconditionally, no affordability cap (see the ledger comment's "natural
+// insolvency" note: reproDebit below charges C_birth for EVERY win, and a candidate that
+// can't cover the total simply dies from it like any other overextension, via the existing
+// death/deposit path). Requires reading each empty neighbor's own full 1-ring (via
+// resolveReproWinner) since "did I win tile E" depends on E's OTHER candidates too, not just
+// coordP's own data -- a real perf cost, bounded at 8 neighbors x 8 reads each.
+uint countReproWins(ivec2 coordP, uvec4 ownersP[8], uint teamP, ivec2 size) {
+    uint wins = 0u;
+    for (uint idxP = 0u; idxP < 8u; idxP++) {
+        if (ownersP[idxP].r != 0u) continue; // only empty neighbors are contestable
+
+        ivec2 coordE = coordP + OFFSETS[idxP];
+        coordE.x = (coordE.x + size.x) % size.x;
+        coordE.y = (coordE.y + size.y) % size.y;
+
+        uint winnerOwner, winSlot;
+        resolveReproWinner(coordE, size, winnerOwner, winSlot);
+
+        // OFFSETS is symmetric in opposite pairs (0<->7, 1<->6, 2<->5, 3<->4), so "P's own
+        // slot pointing at E" and "E's slot pointing back at P" always satisfy idxE = 7-idxP.
+        // Checking that here (not just winnerOwner==teamP) is what makes this
+        // collision-proof: a DIFFERENT same-team neighbor of E, at a different offset, would
+        // fail this check even though its team id matches.
+        if (winnerOwner == teamP && winSlot == (7u - idxP)) wins++;
+    }
+    return wins;
+}
+
+// Phase B ("resolve"): reads persisted start-of-tick state plus Phase A's now-frozen
+// published intents, writes the final new state by gather.
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(inputImage);
@@ -136,7 +439,7 @@ void main() {
 
     uvec4 self = imageLoad(inputImage, coord);
     uint currentOwner = self.r;
-    float currentEnergy = decodeEnergy(self.b, self.a);
+    int currentEnergy = energyOf(self);
 
     // Load all 8 neighbors once; reused below for combat resolution and diffusion.
     uvec4 neighbors[8];
@@ -150,30 +453,26 @@ void main() {
         neighbors[idx] = imageLoad(inputImage, neighborCoord);
     }
 
-    int teamIdx = int(currentOwner) - 1; // only meaningful while currentOwner != 0u
+    // This cell's own conductivity (all 4 directions) -- needed for the conductivity-growth
+    // section at the end of this function. Neighbor conductivity is NOT needed here anymore:
+    // Phase A already resolved each giving cell's own effective rate/share using its own
+    // conductivity (see Phase A's main() above), so Phase B just reads the published result.
+    uvec4 selfCond = imageLoad(inputConductivity, coord);
 
-    // Randomize scan order per-cell/frame so no direction is systematically favored.
-    uint startIdx = hash(uint(coord.x) * 92821u + uint(coord.y) * 68917u + uFrame * 40699u) % 8u;
+    int teamIdx = int(currentOwner) - 1; // only meaningful for a real team (1..MAX_TEAMS); unused for empty/source/deposit cells
 
-    // Reproduction: unclaimed land may get claimed by one random qualifying neighbor this
-    // tick. Unchanged in spirit from before -- still probabilistic, and only reachable when
-    // currentOwner == 0u (there's no energy here to erode, so combat doesn't apply).
+    // Reproduction: unclaimed land gets claimed by whichever candidate neighbor published the
+    // highest bid this tick (design doc §12.3: "highest bid wins," ties broken by hash),
+    // resolved via the shared oracle above -- see resolveReproWinner's comment for why this
+    // is what actually fixes the old inconsistency: this cell's own view of "who wins me" and
+    // any candidate's view of "do I win this tile" are now the identical computation over the
+    // same frozen data, not two different approximations of the same question.
     uint claimant = 0u;
     if (currentOwner == 0u) {
-        for (uint i = 0u; i < 8u; i++) {
-            uint idx = (startIdx + i) % 8u;
-            uint neighborOwner = neighbors[idx].r;
-            if (neighborOwner == 0u) continue;
-
-            // No defending energy to overcome, so the odds are the flat action chance scaled
-            // by the claimant's own reproductionWillingness -- an eager team claims empty land
-            // faster than a reluctant one, though both pay the same EXPECTED total cost per
-            // success (see totalAttackSpend below).
-            int claimantTeamIdx = int(neighborOwner) - 1;
-            float pWin = uExpandChance * uReproductionWillingness[claimantTeamIdx];
-            float roll = randFloat(coord, uFrame, idx);
-            if (roll < pWin) { claimant = neighborOwner; break; }
-        }
+        uint winnerOwner, winSlot;
+        resolveReproWinner(coord, size, winnerOwner, winSlot);
+        claimant = winnerOwner;
+        if (claimant != 0u) atomicAdd(claimCount, 1u);
     }
 
     // Combat: a claimed cell deterministically erodes under fire from every hostile neighbor
@@ -182,175 +481,210 @@ void main() {
     // summed across every hostile neighbor, then reduced by this cell's own defenseFraction
     // as a straight percentage mitigation (capped well below 1.0 so an out-of-range --stats
     // override can never push it negative/healing). This is a separate ledger from the flat
-    // totalAttackSpend an attacker pays just for bordering an enemy (below) -- both sides
-    // burn energy independently while in contact, rather than one funding the other.
-    uint unclaimedNeighborCount = 0u;
+    // enemyContactTax an attacker pays just for bordering an enemy (below) -- both sides burn
+    // energy independently while in contact, rather than one funding the other.
     bool hasEnemyNeighbor = false;
-    float combatDamage = 0.0;
-    if (currentOwner != 0u) {
+    int combatDamage = 0;
+    if (currentOwner != 0u && currentOwner < DEPOSIT_ID) {
         for (uint idx = 0u; idx < 8u; idx++) {
             uint neighborOwner = neighbors[idx].r;
             if (neighborOwner == currentOwner) continue;
-            if (neighborOwner == 0u) { unclaimedNeighborCount++; continue; }
+            if (neighborOwner == 0u || neighborOwner >= DEPOSIT_ID) continue; // unclaimed, or source/deposit: not a combat participant
             hasEnemyNeighbor = true;
-            float attackerEnergy = decodeEnergy(neighbors[idx].b, neighbors[idx].a);
+            int attackerEnergy = energyOf(neighbors[idx]);
             int attackerTeamIdx = int(neighborOwner) - 1;
-            combatDamage += attackerEnergy * uAggressionFraction[attackerTeamIdx];
+            combatDamage += int(mulShift(uint(attackerEnergy), uAggressionFraction[attackerTeamIdx]));
         }
-        float mitigation = 1.0 - min(uDefenseFraction[teamIdx], 0.9);
-        combatDamage *= mitigation;
+        uint mitigationQ16 = 65536u - min(uDefenseFraction[teamIdx], uint(0.9 * 65536.0));
+        combatDamage = int(mulShift(uint(combatDamage), mitigationQ16));
+    }
+    // NOT routed to waste here -- combatDamage is "erosion" (see the final resolution block
+    // below), which is waived entirely on the tick a cell dies, so it's only ever actually
+    // charged (and only then added to waste) on the surviving path.
+
+    // Enemy-contact maintenance tax: a flat per-tick cost of maintaining aggression/defense
+    // while bordering an enemy, regardless of how many enemy neighbors are touched (the
+    // damage dealt already scales with enemy-neighbor count via combatDamage above, so this
+    // fee deliberately doesn't double up on that). Also "erosion" -- see the note above.
+    //
+    int enemyContactTax = 0;
+    if (currentOwner != 0u && currentOwner < DEPOSIT_ID && hasEnemyNeighbor) {
+        uint taxRateQ16 = uAggressionFraction[teamIdx] + uDefenseFraction[teamIdx];
+        enemyContactTax = min(int(mulShift(uint(currentEnergy), taxRateQ16)), currentEnergy);
     }
 
-    // Attacker-side energy debit: committing energy toward reproduction or aggression/defense
-    // costs that energy whether or not it actually pays off this tick. Aggression+defense
-    // remains a single flat commitment regardless of how many enemy neighbors are touched
-    // (bundled, since both trigger off the same "bordering an enemy" condition) -- the damage
-    // dealt already scales with enemy-neighbor count via combatDamage above, so this maintenance
-    // fee deliberately doesn't double up on that.
+    // Reproduction debit: the parent-side mirror of the claimant loop above. Re-derives, from
+    // this cell's own already-loaded 1-ring, exactly how many of its unclaimed neighbors it
+    // actually wins this tick (countReproWins) -- the same figure any winning child's own
+    // resolveReproWinner call agrees on, so there's no possibility of this cell debiting
+    // itself for a win a different parent actually got, or failing to debit for one it did.
+    // C_birth (own startEnergy * uReproductionCostMultiplier) is charged per win,
+    // UNCONDITIONALLY -- no cap on how many simultaneous wins get honored (see the ledger
+    // comment's "natural insolvency" note: if this drives the cell's own balance negative,
+    // the existing death/deposit path below already handles it correctly).
     //
-    // Reproduction's cost, by contrast, is charged PER contested unclaimed edge (not once
-    // per cell), because each unclaimed neighbor runs its own independent reproduction roll
-    // (see the claimant loop above) -- a cell touching k unclaimed neighbors is simultaneously
-    // entered in k separate lotteries and can win more than one in the same tick, minting a
-    // fresh startEnergy on each empty cell that succeeds. A flat per-cell charge here let a
-    // wide frontier (many unclaimed edges per attacker, exactly the situation at the start of
-    // a run) mint far more energy via simultaneous claims than the flat fee ever paid for --
-    // confirmed via the total-energy-vs-source-income check in main.cpp's
-    // checkEnergyConservation(), which measured total grid energy growing ~80x faster than
-    // source income could account for. Charging per unclaimed edge instead keeps the original
-    // invariant (expected total spend before ONE contested edge resolves is startEnergy *
-    // uReproductionCostMultiplier, independent of willingness) but now holds per-edge rather
-    // than assuming at most one edge per attacker.
-    float totalAttackSpend = 0.0;
-    if (currentOwner != 0u) {
-        if (unclaimedNeighborCount > 0u) {
-            float effectiveExpandChance = uExpandChance * uReproductionWillingness[teamIdx];
-            totalAttackSpend += float(unclaimedNeighborCount) * effectiveExpandChance * uStartEnergy[teamIdx] * uReproductionCostMultiplier;
-        }
-        if (hasEnemyNeighbor) totalAttackSpend += currentEnergy * (uAggressionFraction[teamIdx] + uDefenseFraction[teamIdx]);
-        totalAttackSpend = min(totalAttackSpend, currentEnergy); // can't go into energy debt
+    // Ledger accounting for this is deferred until AFTER netTransfer/harvestGain are computed
+    // below -- see the addWaste/addInjected calls following the harvest block. It needs both:
+    // a winning child ALWAYS receives its full startEnergy (see the currentOwner==0u branch)
+    // regardless of whether this parent can truly afford it (natural insolvency, decision #3),
+    // so the amount actually recoverable from THIS cell for reproduction specifically has to be
+    // computed the same way "remaining" itself is (currentEnergy + harvestGain + netTransfer,
+    // clamped at 0) -- reusing raw reproDebit here would silently assume the parent's payment
+    // always succeeds in full, which is exactly the assumption natural insolvency breaks.
+    uint reproWins = 0u;
+    int reproDebit = 0;
+    if (currentOwner != 0u && currentOwner < DEPOSIT_ID) {
+        reproWins = countReproWins(coord, neighbors, currentOwner, size);
+        int cBirth = int(mulShift(uint(uStartEnergy[teamIdx]), uReproductionCostMultiplier));
+        reproDebit = int(reproWins) * cBirth;
     }
 
-    // Per-cardinal-direction energy sharing, boosted by conductivity (see effectiveRate).
-    // Two components are combined, and the STRONGER of the two wins per edge:
+    // Per-cardinal-direction energy sharing (design rationale unchanged from before this
+    // migration -- see git history for the full baseShare/surplusShare/efficiency derivation
+    // -- only WHERE it's computed changed): Phase A already resolved each giving cell's own
+    // "sent" amount per direction using only that cell's own 1-ring data (own surplus, own
+    // conductivity -- see Phase A's main() above), so Phase B's job is just to READ those
+    // already-resolved, now-frozen values instead of recomputing them. This is a pure
+    // internal refactor: every operation is exact integer math over identical operands
+    // either way, so the result is bit-for-bit identical to the pre-migration formula.
     //
-    //  - baseShare: the original plain-diffusion term, proportional to the raw energy gap to
-    //    this specific neighbor. Kept as an unconditional floor -- see below for why.
-    //  - surplusShare: energy above this team's satisfaction target (uEnergySatisfied) pushed
-    //    toward a poorer neighbor regardless of how small the immediate gap to them is, so an
-    //    interior "trunk" cell fed from behind keeps pumping its surplus onward every tick even
-    //    after locally equalizing with its neighbors, instead of settling into the flow-starved
-    //    equilibrium plain diffusion produces once gaps shrink to near zero. That starvation
-    //    was the original problem: it kept conductivity (needs throughput to grow) from
-    //    building up along a path's whole length, confining strong flow to the single sharp
-    //    gap right at an active frontier's leading tip.
-    //
-    // Using surplusShare ALONE (no baseShare floor) was tried first and broke the sim: every
-    // freshly-claimed cell starts at startEnergy, which is below every team's satisfaction
-    // target, so a newly-claimed frontier -- where most neighbors are also fresh and below
-    // target -- got literally zero mutual support (neighborSurplus/selfSurplus both 0) and
-    // starved en masse under nothing but upkeep, visible as territory fragmenting into
-    // flickering single-pixel noise instead of stable blobs. Taking max(baseShare,
-    // surplusShare) keeps the old baseline diffusion always available as a safety net, while
-    // still letting genuine surplus (mainly near sources, and along paths that have built up
-    // conductivity) punch well above what plain diffusion would allow.
-    //
-    // Both terms, and the final result, stay capped by the actual pairwise gap (min() below)
-    // -- can't push/pull past what the other side actually has relative to me. Needed for
-    // surplusShare specifically: pushing past the gap risks flipping who's richer in a single
-    // tick, which round-trips into oscillation/flicker between adjacent cells at high
-    // conductivity.
-    //
-    // surplusShare is divided by 4 (the max possible cardinal same-team neighbors) before
-    // being applied per edge -- unlike baseShare, which is naturally self-limiting per edge (a
-    // specific neighbor's gap can't exceed currentEnergy), surplus is the SAME value for every
-    // qualifying edge this cell has, so applying it undivided let a cell with 2+ poorer
-    // same-team neighbors pledge its *entire* surplus to each one simultaneously --
-    // overcommitting routinely (any solid blob interior has ~2 poorer cardinal neighbors on
-    // average once above target), not just the rare "several much-poorer neighbors at once"
-    // case the totalGive safety cap below was written for. Dividing by a fixed 4 -- rather
-    // than the giver's actual poorer-neighbor count, which would require reading the giver's
-    // neighbors too (a second ring of texture reads) -- keeps both sides of an edge computing
-    // the identical value from only their own 1-ring data, so conservation stays exact, at the
-    // cost of under-spending when a cell has fewer than 4 poorer neighbors.
-    //
-    // The giving side of each edge always uses its OWN conductivity/surplus, and since the
-    // receiver reads the giver's energy directly, "the giver's surplus" as computed by the
-    // receiver and "my surplus" as computed by the giver are the same value -- so a gain on
-    // one side always exactly matches a loss on the other, same conservation guarantee as
-    // before. Also tracks how much is given away separately so it can still be capped --
-    // defense in depth, should rarely trigger now that per-edge pushes are budgeted not to sum
-    // past a cell's own surplus. grossThroughput (the sum of what actually moved, both
-    // directions) is what drives this cell's own conductivity growth below.
-    float netTransfer = 0.0;
-    float totalGive = 0.0;
-    float grossThroughput = 0.0;
-    if (currentOwner != 0u) {
-        float selfConductivity = decodeConductivity(self.g);
-        float satisfied = uEnergySatisfied[teamIdx];
-        float selfSurplus = max(currentEnergy - satisfied, 0.0);
+    // For each cardinal edge: if I published a nonzero give in that direction, I'm the giver
+    // -- I lose the full committed amount regardless of efficiency (my own ledger doesn't
+    // know or care whether the trip succeeds). Otherwise, check whether THAT neighbor
+    // published a give pointed back at me (its channel for the opposite direction) -- if so,
+    // I'm the receiver, and I only credit myself the efficiency-scaled fraction; the
+    // difference is real loss, not rounding, and goes to waste. At most one side of any edge
+    // ever has a nonzero give, by construction (Phase A only publishes a give where the
+    // giver is strictly richer), so these two checks can't both fire for the same edge.
+    // directionalThroughput[c] records this edge's actual gross flow, feeding this
+    // direction's own conductivity growth after the loop -- never the other 3 directions'.
+    int netTransfer = 0;
+    int directionalThroughput[4] = int[](0, 0, 0, 0);
+    if (currentOwner != 0u && currentOwner < DEPOSIT_ID) {
+        uvec4 myGive = imageLoad(intentTransferTex, coord);
 
         for (uint c = 0u; c < 4u; c++) {
             uint idx = CARDINAL_IDX[c];
             if (neighbors[idx].r != currentOwner) continue;
-            float neighborEnergy = decodeEnergy(neighbors[idx].b, neighbors[idx].a);
-            float neighborConductivity = decodeConductivity(neighbors[idx].g);
-            float neighborSurplus = max(neighborEnergy - satisfied, 0.0);
 
-            float share = 0.0;
-            if (neighborEnergy > currentEnergy) {
-                // I receive, using the GIVER's own conductivity/surplus, pre-divided across
-                // its up-to-4 cardinal edges (see comment above).
-                float rate = effectiveRate(uTransferRate[teamIdx], neighborConductivity);
-                float baseShare = rate * (neighborEnergy - currentEnergy);
-                float surplusShare = rate * neighborSurplus / 4.0;
-                share = min(max(baseShare, surplusShare), neighborEnergy - currentEnergy);
-            } else if (neighborEnergy < currentEnergy) {
-                // I give, using MY OWN conductivity/surplus, pre-divided across my up-to-4
-                // cardinal edges.
-                float rate = effectiveRate(uTransferRate[teamIdx], selfConductivity);
-                float baseShare = rate * (currentEnergy - neighborEnergy);
-                float surplusShare = rate * selfSurplus / 4.0;
-                share = -min(max(baseShare, surplusShare), currentEnergy - neighborEnergy);
+            uint myChannel = CONDUCTIVITY_CHANNEL[c];
+            int share = 0;
+            int sent = 0;
+
+            if (myGive[myChannel] > 0u) {
+                // I'm the giver on this edge.
+                sent = int(myGive[myChannel]);
+                share = -sent;
+            } else {
+                // Maybe the neighbor gave to me: read its published intent at the channel
+                // pointing back at me.
+                ivec2 nc = coord + OFFSETS[idx];
+                nc.x = (nc.x + size.x) % size.x;
+                nc.y = (nc.y + size.y) % size.y;
+                uvec4 theirGive = imageLoad(intentTransferTex, nc);
+                uint theirChannel = CONDUCTIVITY_CHANNEL[OPPOSITE_CARDINAL[c]];
+                if (theirGive[theirChannel] > 0u) {
+                    sent = int(theirGive[theirChannel]);
+                    share = int(mulShift(uint(sent), uTransferEfficiency));
+                    addWaste(sent - share);
+                }
             }
 
             netTransfer += share;
-            grossThroughput += abs(share);
-            if (share < 0.0) totalGive += -share;
-        }
-        if (totalGive > currentEnergy) {
-            // Safety cap: claw back the excess so this cell can't go into debt from giving.
-            // Rare in practice -- only kicks in with several much-poorer neighbors and a
-            // high effective rate at once. Those neighbors still compute their own receive
-            // amount independently and won't see this cap, so this is a small, accepted
-            // approximation in that specific edge case rather than an exact conservation
-            // guarantee.
-            netTransfer += (totalGive - currentEnergy);
+            directionalThroughput[c] = sent;
         }
     }
 
-    // Conductivity update: decay-then-accumulate, using the real throughput just computed.
-    // Gross (both directions summed as absolute values), not net -- a perfect mid-trunk
-    // conduit both receives from the source side and gives to the frontier side
-    // simultaneously, so net flow could be near zero even while gross throughput (and thus
-    // reinforcement) is high.
-    float newConductivity = 0.0;
-    if (currentOwner != 0u) {
-        float oldConductivity = decodeConductivity(self.g);
-        newConductivity = clamp(
-            oldConductivity * (1.0 - uConductivityDecay) + uConductivityGain * grossThroughput,
-            0.0, 4.0
-        );
+    // Harvest: any claimed cell bordering a source/deposit draws an equal share of its fixed
+    // per-tick budget, split across however many claimed cells currently border it -- every
+    // claimant independently re-reads the source/deposit's own 1-ring (the same
+    // shared-reference-coordinate trick the reproduction contest above uses) to count
+    // claimants and compute the identical per-cell share, so the total handed out per
+    // source/deposit stays fixed and predictable regardless of how many teams happen to be
+    // touching it.
+    //
+    // The integer-divide remainder from splitting a pool across claimants is NOT a loss for a
+    // source: its stored strength never decreases (see the SOURCE_ID branch below), so
+    // whatever fraction isn't evenly divisible this tick simply isn't generated this tick --
+    // there's no debit anywhere to conserve against, same as a factory running below its rated
+    // capacity. For a deposit, the remainder DOES matter: it's actually subtracted and carried
+    // forward as the deposit's own new balance (see the DEPOSIT_ID branch below), so nothing
+    // is lost there either, UNTIL the pool finally drains down to a dust remainder too small to
+    // cover one more whole share -- that final tiny remainder is genuinely destroyed and is
+    // routed to waste right where it happens, in the DEPOSIT_ID branch.
+    int harvestGain = 0;
+    if (currentOwner != 0u && currentOwner < DEPOSIT_ID) {
+        for (uint idx = 0u; idx < 8u; idx++) {
+            uint nOwner = neighbors[idx].r;
+            if (nOwner != DEPOSIT_ID && nOwner != SOURCE_ID) continue;
+
+            ivec2 srcCoord = coord + OFFSETS[idx];
+            srcCoord.x = (srcCoord.x + size.x) % size.x;
+            srcCoord.y = (srcCoord.y + size.y) % size.y;
+
+            int pool = energyOf(neighbors[idx]);
+
+            uint claimedCount = 0u;
+            for (uint k = 0u; k < 8u; k++) {
+                ivec2 sNeighborCoord = srcCoord + OFFSETS[k];
+                sNeighborCoord.x = (sNeighborCoord.x + size.x) % size.x;
+                sNeighborCoord.y = (sNeighborCoord.y + size.y) % size.y;
+                uvec4 sn = imageLoad(inputImage, sNeighborCoord);
+                if (sn.r != 0u && sn.r < DEPOSIT_ID) claimedCount++;
+            }
+            if (claimedCount == 0u) continue;
+
+            harvestGain += pool / int(claimedCount);
+        }
+    }
+    addInjected(harvestGain); // one injection point -- see LedgerBuffer comment
+
+    // Reproduction ledger accounting (deferred from the reproDebit block above so harvestGain/
+    // netTransfer are both known): a winning child mints its full startEnergy unconditionally
+    // -> always tracked as injected. What THIS cell actually pays for it is bounded by what it
+    // actually has available before erosion (currentEnergy + harvestGain + netTransfer, clamped
+    // at 0 -- the same pre-erosion pool "remaining" itself draws from below), not by the nominal
+    // reproDebit -- under natural insolvency those two amounts can differ, and only the former
+    // is real energy that actually left this cell (reproDebit above stays uncapped so it can
+    // still legitimately drive this cell into the death/deposit path -- only the LEDGER
+    // bookkeeping here is capped, not the gameplay effect). Solvent case: this reduces to
+    // exactly reproDebit, so waste == wins*(C_birth-startEnergy) net of the injected credit,
+    // identical to the pre-migration accounting. Insolvent case: waste is correctly capped at
+    // what this cell actually had, so the portion of the mint it couldn't truly fund is no
+    // longer silently uncounted -- see resolveReproWinner's comment for the bug this closes.
+    if (reproWins > 0u) {
+        int availableForRepro = max(0, currentEnergy + harvestGain + netTransfer);
+        int actualReproSpend = min(reproDebit, availableForRepro);
+        addWaste(actualReproSpend);
+        addInjected(int(reproWins) * uStartEnergy[teamIdx]);
     }
 
-    float sourceGain = (currentOwner != 0u) ? imageLoad(uSourceMap, coord).r : 0.0;
-    float upkeep = (currentOwner != 0u) ? uUpkeepCost : 0.0;
+    // Also "erosion" -- see the note above combatDamage/enemyContactTax.
+    int upkeep = (currentOwner != 0u && currentOwner < DEPOSIT_ID) ? uUpkeepCost : 0;
 
-    float netEnergyChange = sourceGain + netTransfer - totalAttackSpend - upkeep - combatDamage;
+    int netEnergyChange = harvestGain + netTransfer - enemyContactTax - reproDebit - upkeep - combatDamage;
+
+    // Erosion: metabolism, enemy-contact tax, and combat damage -- pure destruction, not tied
+    // to any other invocation's already-applied credit. Waived entirely on the tick a cell
+    // dies (see below), so it's only actually charged, and only then routed to waste, on the
+    // surviving path.
+    int erosion = upkeep + enemyContactTax + combatDamage;
+
+    // Pre-erosion remaining balance: currentEnergy plus every flow this tick that's already
+    // committed one way or another -- transfer give/receive and reproDebit are promises this
+    // cell already made to (or credits it already banked from) other invocations reading its
+    // own start-of-tick state, and harvestGain is an unconditional credit from a source/
+    // deposit -- none of those can be undone just because THIS cell turns out to die this
+    // tick. Only erosion gets waived. Clamped at 0 for a rare, accepted edge case: transfer-
+    // give and reproDebit are each individually bounded by currentEnergy (see their own
+    // comments) but not JOINTLY bounded against each other, so a cell maxing out both at once
+    // could in theory want to commit slightly more than it has -- the same kind of tolerance
+    // this codebase already extends to other rare multi-mechanism edge cases.
+    int remaining = max(0, currentEnergy + netEnergyChange + erosion);
 
     uint newOwner;
-    float newEnergy;
-    float finalConductivity;
+    int newEnergy;
+    uint newAge;
 
     if (currentOwner == 0u) {
         if (claimant != 0u) {
@@ -358,23 +692,87 @@ void main() {
             newEnergy = uStartEnergy[int(claimant) - 1];
         } else {
             newOwner = 0u;
-            newEnergy = 0.0;
+            newEnergy = 0;
         }
-        finalConductivity = 0.0; // freshly claimed (or still empty): no relay history yet
-    } else if ((currentEnergy + netEnergyChange) <= 0.0) {
-        // Starved: upkeep, net sharing, attack-spend, and/or combat damage outpaced supply --
-        // reverts to unclaimed land, to be recontested through the reproduction path above
-        // like any other empty tile (no separate "conqueror" grant).
-        newOwner = 0u;
-        newEnergy = 0.0;
-        finalConductivity = 0.0;
+        newAge = 0u; // freshly claimed (or still empty): no history yet
+    } else if (currentOwner == DEPOSIT_ID) {
+        // Drains by however much is being harvested this tick -- mirrors exactly what each
+        // claimed neighbor independently computes as its own harvestGain contribution from
+        // this cell (see the harvest block above), so the two always agree without needing
+        // to communicate (same shared-reference-coordinate trick, just from the source/
+        // deposit's own side this time, using its already-loaded 1-ring instead of a fresh
+        // read). With no claimed neighbor bordering it, a deposit just persists unchanged --
+        // it's an inert, un-owned pile until someone actually claims adjacent land, not a
+        // ticking clock. Only reverts to unclaimed once it's ACTUALLY been drained down to a
+        // dust remainder too small to cover even one more whole per-claimant share, at which
+        // point that final tiny remainder is routed to waste (it never reaches any claimant,
+        // so it's genuinely destroyed, not just "not yet given").
+        uint claimedCount = 0u;
+        for (uint idx = 0u; idx < 8u; idx++) {
+            uint nOwner = neighbors[idx].r;
+            if (nOwner != 0u && nOwner < DEPOSIT_ID) claimedCount++;
+        }
+        if (claimedCount == 0u) {
+            newOwner = DEPOSIT_ID;
+            newEnergy = currentEnergy;
+        } else {
+            int drained = (currentEnergy / int(claimedCount)) * int(claimedCount);
+            int remainingPool = currentEnergy - drained;
+            if (remainingPool < int(claimedCount)) {
+                addWaste(remainingPool);
+                newOwner = 0u;
+                newEnergy = 0;
+            } else {
+                newOwner = DEPOSIT_ID;
+                newEnergy = remainingPool;
+            }
+        }
+        newAge = 0u;
+    } else if (currentOwner == SOURCE_ID) {
+        // Never depletes, never erodes -- passes through unchanged.
+        newOwner = SOURCE_ID;
+        newEnergy = currentEnergy;
+        newAge = 0u;
+    } else if (remaining < erosion) {
+        // Dies: erosion this tick is waived, so the full pre-erosion remainder drops as a
+        // lootable deposit instead of erosion consuming it down to ~0 first -- see §3's
+        // ledger design (DEPOSITS is a real, harvestable bucket, not a formality). Reverts to
+        // unclaimed land through the normal reproduction path once the deposit itself later
+        // drains to dust (see the DEPOSIT_ID branch above).
+        newOwner = DEPOSIT_ID;
+        newEnergy = remaining;
+        newAge = 0u;
     } else {
         newOwner = currentOwner;
-        newEnergy = clamp(currentEnergy + netEnergyChange, 0.0, uEnergyCapacity);
-        finalConductivity = newConductivity; // held by the same team: apply the decay+accumulate update
+        int postErosion = remaining - erosion;
+        addWaste(erosion); // actually charged this tick -- destroyed, not banked
+        newEnergy = clamp(postErosion, 0, uEnergyCapacity);
+        // Capacity overflow used to just silently disappear -- now routed to waste like every
+        // other destroyed amount.
+        if (postErosion > uEnergyCapacity) addWaste(postErosion - uEnergyCapacity);
+        newAge = min(self.g + 1u, 65535u); // held by the same team: age ticks up, capped at channel width
     }
 
     uint newB, newA;
-    encodeEnergy(newEnergy, newB, newA);
-    imageStore(outputImage, coord, uvec4(newOwner, encodeConductivity(finalConductivity), newB, newA));
+    packEnergy(newEnergy, newB, newA);
+    imageStore(outputImage, coord, uvec4(newOwner, newAge, newB, newA));
+
+    // Conductivity update: decay-then-accumulate per direction, using each direction's own
+    // real throughput from the sharing loop above -- NOT gross-pooled across all 4 like the
+    // old single-scalar version, so routes can specialize per-direction (e.g. strong N-S
+    // throughput without S-E-W contamination). Only carried forward if this cell survives
+    // AS THE SAME TEAM this tick (newOwner == currentOwner) -- a newly-claimed cell, one that
+    // dies to a deposit, or a source/deposit cell all reset to 0, no relay history yet/anymore.
+    uvec4 newCond = uvec4(0u);
+    if (newOwner == currentOwner && currentOwner != 0u && currentOwner < DEPOSIT_ID) {
+        for (uint c = 0u; c < 4u; c++) {
+            uint channel = CONDUCTIVITY_CHANNEL[c];
+            float old = decodeConductivity(selfCond[channel]);
+            float throughputReal = float(directionalThroughput[c]) / float(ENERGY_SCALE);
+            float grown = clamp(old * (1.0 - uConductivityDecay) + uConductivityGain * throughputReal, 0.0, 4.0);
+            newCond[channel] = encodeConductivity(grown);
+        }
+    }
+    imageStore(outputConductivity, coord, newCond);
 }
+#endif // CA_PHASE_B

@@ -26,6 +26,7 @@
     <None Include="shaders\cellular.comp" />
     <None Include="shaders\screen.vert" />
     <None Include="shaders\screen.frag" />
+    <None Include="..\..\..\..\Downloads\neural-ca-design-v0.2.md" />
   </ItemGroup>
   <ItemGroup>
     <Library Include="lib\glfw3.lib" />
